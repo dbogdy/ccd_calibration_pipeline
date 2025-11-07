@@ -1,0 +1,13 @@
+# .gitignore
+__pycache__/
+*.py[cod]
+*.so
+.env
+venv/
+env/
+.ipynb_checkpoints/
+*.log
+.DS_Store
+*.pyc
+# optionally ignore large FITS if you don't want them in repo:
+*.fits
