@@ -7,7 +7,7 @@ CCD calibration utilities for building master calibration frames
 Features
 --------
 - Robust grouping of FITS frames by:
-  (IMAGETYP, (XBINNING, YBINNING), GAIN, EXPTIME, rounded CCD-TEMP).
+    (IMAGETYP, (XBINNING, YBINNING), GAIN, EXPTIME, rounded CCD-TEMP).
 - Temperature rounding with configurable step and tolerance reuse.
 - Master selection with exposure- and temperature-matching tolerances.
 - Sigma-clipped median combination with MAD-based dispersion.
@@ -56,7 +56,13 @@ logger = logging.getLogger(__name__)
 
 # Key:
 # (IMAGETYP, (XBINNING, YBINNING), GAIN, EXPTIME, CCD-TEMP-rounded)
-NumberKey = Tuple[str, Tuple[Optional[int], Optional[int]], Optional[int], Optional[float], Optional[float]]
+NumberKey = Tuple[
+    str,
+    Tuple[Optional[int], Optional[int]],
+    Optional[int],
+    Optional[float],
+    Optional[float],
+]
 GroupMap = Dict[NumberKey, List[Tuple[Path, fits.Header]]]
 
 __all__ = [
@@ -83,7 +89,9 @@ def _enable_debug_logger() -> None:
     logger.propagate = False
 
 
-def load_files(directory: Union[str, Path], extensions: Sequence[str] = ("*.fit", "*.fits")) -> List[Path]:
+def load_files(
+    directory: Union[str, Path], extensions: Sequence[str] = ("*.fit", "*.fits")
+) -> List[Path]:
     """
     Recursively collect FITS files from a directory.
 
@@ -164,7 +172,7 @@ def grouping(
     CCD-TEMP handling:
         - Temperature is rounded using 'round_step'.
         - If an existing group has compatible metadata and
-          |ΔT| <= temp_tolerance, the file is attached to that group.
+            |ΔT| <= temp_tolerance, the file is attached to that group.
 
     Only primary headers are read for performance.
 
@@ -194,7 +202,10 @@ def grouping(
             header = fits.getheader(file, ext=0)
 
             filetype = str(header.get("IMAGETYP", "")).strip().upper()
-            binning = (_safe_int(header.get("XBINNING")), _safe_int(header.get("YBINNING")))
+            binning = (
+                _safe_int(header.get("XBINNING")),
+                _safe_int(header.get("YBINNING")),
+            )
             gain = _safe_int(header.get("GAIN"))
             exposure = _safe_float(header.get("EXPTIME"))
             temperature = _round_temp(header.get("CCD-TEMP"), step=round_step)
@@ -202,7 +213,7 @@ def grouping(
             matched_key: Optional[NumberKey] = None
 
             # Search for an existing compatible key within temperature tolerance.
-            for (k_type, k_bin, k_gain, k_exp, k_temp) in list(groups.keys()):
+            for k_type, k_bin, k_gain, k_exp, k_temp in list(groups.keys()):
                 if k_type != filetype:
                     continue
                 if k_bin != binning:
@@ -225,7 +236,13 @@ def grouping(
                     matched_key = (k_type, k_bin, k_gain, k_exp, k_temp)
                     break
 
-            key: NumberKey = matched_key or (filetype, binning, gain, exposure, temperature)
+            key: NumberKey = matched_key or (
+                filetype,
+                binning,
+                gain,
+                exposure,
+                temperature,
+            )
             groups[key].append((file, header))
 
         except Exception:
@@ -266,7 +283,7 @@ def _find_single_match(
     """
     candidate_keys: List[NumberKey] = []
 
-    for (m_type, m_bin, m_gain, m_exp, m_temp) in master_groups.keys():
+    for m_type, m_bin, m_gain, m_exp, m_temp in master_groups.keys():
         if m_type != want_type:
             continue
         if m_bin != binning:
@@ -303,7 +320,10 @@ def _find_single_match(
     # Prefer the newest master file for this key.
     return sorted(files, key=lambda t: t[0].stat().st_mtime, reverse=True)[0]
 
-def _normalize_master_paths(master_files: Optional[Union[str, Path, Iterable[Union[str, Path]]]]) -> List[Path]:
+
+def _normalize_master_paths(
+    master_files: Optional[Union[str, Path, Iterable[Union[str, Path]]]],
+) -> List[Path]:
     """
     Normalize user-provided master paths.
 
@@ -314,7 +334,7 @@ def _normalize_master_paths(master_files: Optional[Union[str, Path, Iterable[Uni
     """
     if master_files is None:
         return []
-        
+
     # Single path-like
     if isinstance(master_files, (str, Path)):
         p = Path(master_files)
@@ -355,15 +375,20 @@ def _add_history(meta: Any, text: str) -> None:
         meta["HISTORY"] = [str(prev), text]
 
 
-def _to_ccd(hdu: fits.hdu.image.PrimaryHDU) -> CCDData:
+def _to_ccd(hdu: Union[fits.HDUList, fits.hdu.image.PrimaryHDU]) -> CCDData:
     """
-    Convert a PrimaryHDU to CCDData in ADU with float32 data.
+    Convert a PrimaryHDU or HDUList to CCDData in ADU with float32 data.
 
-    Assumes the primary HDU contains the image data.
+    If HDUList is provided, the primary HDU is used.
     """
+    primary = hdu[0] if isinstance(hdu, fits.HDUList) else hdu
+    data = getattr(primary, "data", None)
+    if data is None:
+        raise ValueError("HDU data is None")
+    header = getattr(primary, "header", {})
     return CCDData(
-        hdu.data.astype(np.float32, copy=False),
-        meta=hdu.header,
+        data.astype(np.float32, copy=False),
+        meta=header,
         unit=u.adu,
     )
 
@@ -391,9 +416,9 @@ def create_master_file(
     Existing masters
     ----------------
     - If ``master_files`` is provided, they are used as candidates
-      for pre-correction (bias/dark) of input frames.
+        for pre-correction (bias/dark) of input frames.
     - If not provided and file_type is DARK or FLAT, existing masters
-      are searched in the ``output`` directory.
+        are searched in the ``output`` directory.
 
     Parameters
     ----------
@@ -460,7 +485,7 @@ def create_master_file(
                     if bias_match:
                         bias_path, _ = bias_match
                         with fits.open(bias_path) as hdul:
-                            master_bias = _to_ccd(hdul[0])
+                            master_bias = _to_ccd(hdul)
 
                 if file_type_norm == "FLAT":
                     dark_match = _find_single_match(
@@ -469,7 +494,7 @@ def create_master_file(
                     if dark_match:
                         dark_path, _ = dark_match
                         with fits.open(dark_path) as hdul:
-                            master_dark = _to_ccd(hdul[0])
+                            master_dark = _to_ccd(hdul)
             except RuntimeError:
                 logger.exception(
                     "Master file matching error for group %s", (ftype, binning, gain)
@@ -481,7 +506,7 @@ def create_master_file(
         for fpath, _ in file_list:
             try:
                 with fits.open(fpath) as hdul:
-                    ccd = _to_ccd(hdul[0])
+                    ccd = _to_ccd(hdul)
 
                 if file_type_norm in {"DARK", "FLAT"}:
                     if master_bias is not None:
@@ -526,12 +551,13 @@ def create_master_file(
 
         if file_type_norm in {"BIAS", "DARK"}:
             master = combine(ccd_list, **combine_kwargs)
-            _add_history(
-                master.meta,
-                f"Master {file_type_norm} bin={binning} "
-                f"gain={gain} exp={_float_str(exposure)}s temp={temperature}C",
-            )
-            _add_history(master.meta, f"Combined from {len(ccd_list)} files")
+            if master is not None:
+                _add_history(
+                    master.meta,
+                    f"Master {file_type_norm} bin={binning} "
+                    f"gain={gain} exp={_float_str(exposure)}s temp={temperature}C",
+                )
+                _add_history(master.meta, f"Combined from {len(ccd_list)} files")
 
         elif file_type_norm == "FLAT":
             # Scale each flat frame by inverse median to normalize illumination.
@@ -542,23 +568,27 @@ def create_master_file(
                     return 1.0
                 return float(1.0 / med)
 
-            combine_kwargs_flat = dict(
-                method="median",
-                scale=inv_median,
-                sigma_clip=sigma,
-                sigma_clip_func=np.ma.median,
-                sigma_clip_dev_func=mad_std,
-            )
+            # Configure combine parameters with proper types
+            combine_kwargs_flat = {
+                "method": "median",  # str
+                "scale": inv_median,  # Callable
+                "sigma_clip": True,  # bool
+                "sigma_clip_low_thresh": 3,  # int
+                "sigma_clip_high_thresh": 3,  # int
+                "sigma_clip_func": np.ma.median,  # Callable
+                "sigma_clip_dev_func": mad_std,  # Callable
+            }
             if mem_limit is not None:
                 combine_kwargs_flat["mem_limit"] = float(mem_limit)
 
             master = combine(ccd_list, **combine_kwargs_flat)
-            _add_history(
-                master.meta,
-                f"Master FLAT bin={binning} "
-                f"gain={gain} exp={_float_str(exposure)}s temp={temperature}C",
-            )
-            _add_history(master.meta, f"Combined from {len(ccd_list)} files")
+            if master is not None:
+                _add_history(
+                    master.meta,
+                    f"Master FLAT bin={binning} "
+                    f"gain={gain} exp={_float_str(exposure)}s temp={temperature}C",
+                )
+                _add_history(master.meta, f"Combined from {len(ccd_list)} files")
 
         if master is None:
             continue
@@ -570,21 +600,38 @@ def create_master_file(
         exp_str = f"{_float_str(exposure)}s" if exposure is not None else "sNA"
         temp_str = f"{_float_str(temperature)}C" if temperature is not None else "CNA"
 
-        out_name = output / f"master_{file_type_norm.lower()}_{bin_str}_{gain_str}_{exp_str}_{temp_str}.fits"
+        out_name = (
+            output
+            / f"master_{file_type_norm.lower()}_{bin_str}_{gain_str}_{exp_str}_{temp_str}.fits"
+        )
 
         try:
             master.data = master.data.astype(np.float32, copy=False)
-            master.to_hdu(hdu_mask=None, hdu_uncertainty=None).writeto(
+            master.to_hdu().writeto(
                 out_name,
                 overwrite=True,
             )
-            logger.info(
-                "Created master file %s from %d files", out_name, len(ccd_list)
-            )
+            logger.info("Created master file %s from %d files", out_name, len(ccd_list))
             created.append(out_name)
         except Exception:
             logger.exception("Failed writing master to %s", out_name)
-
+            # Save only the primary HDU (hdu[0]) without mask and uncertainties
+            try:
+                hdu = master.to_hdu()
+                if isinstance(hdu, list) or isinstance(hdu, fits.HDUList):
+                    primary_hdu = hdu[0]
+                else:
+                    primary_hdu = hdu
+                fits.HDUList([primary_hdu]).writeto(
+                    out_name,
+                    overwrite=True,
+                )
+                logger.info(
+                    "Created master file %s from %d files", out_name, len(ccd_list)
+                )
+                created.append(out_name)
+            except Exception:
+                logger.exception("Failed writing master to %s", out_name)
     return created
 
 
@@ -657,8 +704,10 @@ def calibrate_files(
             continue
 
         # Find best master matches for this group.
-        bias_match = None if no_bias else _find_single_match(
-            master_groups, "BIAS", binning, gain, None, None
+        bias_match = (
+            None
+            if no_bias
+            else _find_single_match(master_groups, "BIAS", binning, gain, None, None)
         )
         dark_match = _find_single_match(
             master_groups, "DARK", binning, gain, exposure, temperature
@@ -674,22 +723,22 @@ def calibrate_files(
         if bias_match:
             bias_path, _ = bias_match
             with fits.open(bias_path) as hdul:
-                master_bias = _to_ccd(hdul[0])
+                master_bias = _to_ccd(hdul)
 
         if dark_match:
             dark_path, _ = dark_match
             with fits.open(dark_path) as hdul:
-                master_dark = _to_ccd(hdul[0])
+                master_dark = _to_ccd(hdul)
 
         if flat_match:
             flat_path, _ = flat_match
             with fits.open(flat_path) as hdul:
-                master_flat = _to_ccd(hdul[0])
+                master_flat = _to_ccd(hdul)
 
         for fp, _ in file_list:
             try:
                 with fits.open(fp) as hdul:
-                    ccd = _to_ccd(hdul[0])
+                    ccd = _to_ccd(hdul)
 
                 if master_bias is not None:
                     ccd = subtract_bias(ccd, master_bias)
@@ -714,13 +763,15 @@ def calibrate_files(
                     flat_data = np.asarray(master_flat.data, dtype=float)
                     finite = flat_data[np.isfinite(flat_data)]
                     if finite.size > 0:
-                        # e.g. 1% din mediana valorilor finite
+                        # e.g. 1% from median value finite
                         flat_floor = max(1e-6, 0.01 * float(np.median(finite)))
                     else:
                         flat_floor = 1e-6
 
                     ccd = flat_correct(ccd, master_flat, min_value=flat_floor)
-                    _add_history(ccd.meta, f"Flat-field corrected (min_value={flat_floor:.3g})")
+                    _add_history(
+                        ccd.meta, f"Flat-field corrected (min_value={flat_floor:.3g})"
+                    )
                 else:
                     logger.warning("Missing FLAT for %s", fp)
 

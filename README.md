@@ -1,85 +1,114 @@
 # 📘 CCD Calibration Pipeline
 
-A Python-based automated pipeline for **calibrating astronomical CCD images**, using `astropy` and `ccdproc`.  
-It builds master calibration frames (BIAS, DARK, FLAT) and applies them to science frames (LIGHT) following standard CCD data reduction practices.
+Automated pipeline in Python for **calibrating CCD images** using [`astropy`](https://docs.astropy.org/) and [`ccdproc`](https://ccdproc.readthedocs.io/).  
+Builds master calibration frames (BIAS, DARK, FLAT) and applies them to science frames (e.g. `LIGHT`) following standard CCD reduction procedures.
+
 ---
+
 ## 🧩 Features
 
-- Automatic grouping of FITS files by metadata (`IMAGETYP`, `XBINNING`, `GAIN`, `EXPTIME`, `CCD-TEMP`)
-- Master frame creation using sigma-clipped median combining with robust dispersion (`mad_std`)
-- Full calibration workflow:
-  1. Bias subtraction  
-  2. Dark subtraction (optional scaling by exposure time)  
-  3. Flat-field correction (adaptive normalization)
-- Robust numerical handling (no divide-by-zero errors)
-- Cross-matching of masters by exposure and temperature tolerance
-- FITS headers store full `HISTORY` of each processing step
+- Automatic grouping of FITS files by:
+  - `IMAGETYP`
+  - binning (`XBINNING`, `YBINNING`)
+  - `GAIN`
+  - `EXPTIME`
+  - rounded `CCD-TEMP` with tolerance-based matching
+- Creation of master frames using:
+  - sigma-clipped median combination
+  - `mad_std` as dispersion estimator
+  - optional bias and dark pre-correction for DARK/FLAT/LIGHT
+- Science frame calibration:
+  1. Bias subtraction (optional)
+  2. Dark subtraction (with optional exposure-time scaling)
+  3. Flat-field correction with protection against divide-by-zero / dead pixels
+- Robust handling:
+  - automatic master selection based on metadata
+  - FITS `HISTORY` updated with each processing step
+  - logging support (`debug` mode)
+- Fully file-system based, no external database required.
+
 ---
-## ⚙️ Requirements
 
-| Dependency  | Version  | Purpose                    |
-|-------------|----------|----------------------------|
-| Python      |  ≥3.10   | Core runtime               |
-| numpy       |  latest  | array operations           |
-| astropy     |   ≥6.0   | FITS I/O and units         |
-| ccdproc     |  latest  | image calibration routines |
+## ⚙️ Installation
 
-Install manually:
+Requires Python ≥ 3.10.
+
+Core dependencies:
+- `numpy`
+- `astropy`
+- `ccdproc`
+
+Install:
+
 ```bash
-    pip install numpy astropy ccdproc
-```
-or use 
-```bash
-    pip install -r requirements.txt
+pip install numpy astropy ccdproc
 ```
 
-📁 Directory Structure
+
+## 📁 Directory Structure
 Expected layout before running the pipeline:
-
+```bash
 project_root/
-│
 ├── raw/
 │   ├── BIAS/
 │   ├── DARK/
 │   ├── FLAT/
-│   └── LIGHT/
-│
-└──calib_dir
-    ├── masters/        # generated master frames
-    ├── calibrated/     # output calibrated images
-    ├── config.ini
-    ├── fits_image_calibration.py
-    ├── run_calibration_pipeline.py
-    └── README.md
+│   └── LIGHT/              # or other science type matching IMAGETYP
+├── calibration 
+│   ├── masters/            # generated master frames
+│   └── calibrated/         # calibrated science frames
+├── config.ini
+├── fits_image_calibration.py
+├── run_calibration_pipeline.py
+└── README.md
+```
+Input FITS files must:
 
-🧰 Configuration (config.ini)
+Contain correct IMAGETYP values: e.g. BIAS, DARK, FLAT, LIGHT
+
+Provide consistent EXPTIME, XBINNING / YBINNING, GAIN
+
+Optionally provide CCD-TEMP for temperature-aware grouping
+
+## 🧰 Configuration
+The pipeline is controlled via an INI file (default: config.ini).
+
 Example:
+```ini
 [GENERAL]
-debug = yes
+debug = yes        # enable verbose logging for internal operations
+```
 
+```ini
 [MASTERS]
-raw_root = ../raw
-master_output = masters
+raw_root = ./raw          # root folder containing BIAS/DARK/FLAT subfolders
+master_output = ./masters # where master files are written
+
 build_bias = yes
 build_dark = yes
 build_flat = yes
-dark_scale = no
 
+dark_no_bias = no         # if yes: do not bias-correct darks when building master DARK
+dark_scale = no           # if yes: scale darks by exposure time
+
+flat_no_bias = no         # if yes: do not bias-correct flats
+flat_dark_scale = no      # if yes: scale darks when correcting flats
+```
+
+```ini
 [CALIBRATION]
-input_root = ../raw
-output_dir = calibrated
-master_files = masters
-file_type = LIGHT
-no_bias = no
-dark_scale = no
+file_type = LIGHT         # IMAGETYP for science frames to calibrate
+input_root = ./raw        # root directory containing science subfolder (e.g. ./raw/LIGHT)
+output_dir = ./calibrated # where calibrated FITS files will be stored
 
-| Section         | Option       | Description                           |
-| --------------- | ------------ | ------------------------------------- |
-| `[GENERAL]`     | `debug`      | Enables verbose console logging       |
-| `[MASTERS]`     | `build_*`    | Control which master frames are built |
-| `[CALIBRATION]` | `output_dir` | Output folder for calibrated FITS     |
+# can be a directory or comma-separated list of FITS master paths
+master_files = ./masters
 
-▶️ Usage
+no_bias = no              # if yes: skip bias subtraction on science frames
+dark_scale = no           # if yes: scale master darks by exposure time
+```
+
+## ▶️ Usage
 
 Run the pipeline using the configuration file:
 ```bash
@@ -89,7 +118,8 @@ or specify a custom one:
 ```bash
     python run_calibration_pipeline.py path/to/config.ini
 ```
-📊 Output
+
+## 📊 Output
 
 | Type                      | Directory     | Example Filename                      |
 | ------------------------- | ------------- | ------------------------------------- |
@@ -98,16 +128,62 @@ or specify a custom one:
 | Master Flat               | `masters/`    | `master_flat_b2x2_g120_sNA_C-20.fits` |
 | Calibrated Science Frames | `calibrated/` | `Light_001_cal.fits`                  |
 
-🔬 Scientific Notes
+## How it works (technical summary)
 
-Combination uses SigmaClip (3σ, 5 iterations) with mad_std dispersion
+1. fits_image_calibration.py
 
-Master matching tolerates ±2 °C in temperature and relative exposure difference ≤ 1e-6
+    - Scans input directories for FITS files.
 
-Bias and dark corrections optional and fully configurable
+    - Groups frames by (IMAGETYP, binning, GAIN, EXPTIME, rounded CCD-TEMP).
 
-FITS metadata and processing history preserved in output headers
+    - Builds master BIAS/DARK/FLAT using ccdproc.combine with sigma clipping and mad_std.
 
-🧠 Future Improvements
+    - Encodes grouping parameters in output filenames.
 
-Automatic filter keyword handling (FILTER/FILT)
+    - Preserves and updates FITS HISTORY.
+
+2. run_calibration_pipeline.py
+
+    - Cite configuration from config.ini.
+
+    - Optionally builds master frames.
+
+    - Calibrates requested science frames with selected masters.
+
+
+## Assumptions and limitations
+
+- Assumes primary image data in the primary HDU.
+
+- Assumes standard FITS keywords:
+
+    - IMAGETYP, EXPTIME, XBINNING, YBINNING, GAIN, CCD-TEMP.
+
+- Designed for single-CCD workflows; multi-extension instruments need adaptation.
+
+- Relies on correct header metadata for reliable master selection.
+
+## 🔬 Scientific Notes
+
+- Combination uses SigmaClip (3σ, 5 iterations) with mad_std dispersion
+
+- Master matching tolerates ±2 °C in temperature and relative exposure difference ≤ 1e-6
+
+- Bias and dark corrections optional and fully configurable
+
+- FITS metadata and processing history preserved in output headers
+
+## 🧠 Future Improvements
+
+- Automatic filter keyword handling (FILTER/FILT)
+
+## References
+
+- Astropy Project: core library and documentation (https://www.astropy.org/)
+
+- Astropy documentation (https://docs.astropy.org/)
+
+- ccdproc: CCD data reduction tools (https://ccdproc.readthedocs.io/)
+                                    (https://github.com/astropy/ccdproc)
+
+

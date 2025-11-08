@@ -1,13 +1,18 @@
 # .gitignore
 __pycache__/
+.vscode/
+*.toml
 *.py[cod]
 *.so
 .env
 venv/
 env/
 .ipynb_checkpoints/
+*.ipynb
 *.log
 .DS_Store
 *.pyc
+*.ini
+
 # optionally ignore large FITS if you don't want them in repo:
 *.fits

@@ -9,8 +9,8 @@ See example in the repository root.
 
 Usage
 -----
-    python run_ccd_pipeline.py            # uses ./config.ini
-    python run_ccd_pipeline.py my.cfg     # uses custom config file
+    python run_calibration_pipeline.py            # uses ./config.ini
+    python run_calibration_pipeline.py my.cfg     # uses custom config file
 """
 
 import sys
@@ -74,54 +74,24 @@ def main(config_path: str = "config.ini") -> None:
 
     # 1) Build master BIAS
     if build_bias:
-        create_master_file(
-            dir_path=raw_root,
-            file_type="BIAS",
-            output=master_output,
-            master_files=None,
+        create_master_file(dir_path=raw_root, file_type="BIAS", output=master_output, master_files=None,
             no_bias=True,          # Bias should not be bias-corrected
-            dark_scale=False,
-            debug=debug,
-            mem_limit=None,
-        )
+            dark_scale=False, debug=debug, mem_limit=None, )
 
     # 2) Build master DARK
     if build_dark:
-        create_master_file(
-            dir_path=raw_root,
-            file_type="DARK",
-            output=master_output,
-            master_files=str(master_output),
-            no_bias=dark_no_bias,
-            dark_scale=dark_scale,
-            debug=debug,
-            mem_limit=None,
-        )
+        create_master_file(dir_path=raw_root, file_type="DARK", output=master_output, master_files=str(master_output),
+            no_bias=dark_no_bias, dark_scale=dark_scale, debug=debug, mem_limit=None, )
 
     # 3) Build master FLAT
     if build_flat:
-        create_master_file(
-            dir_path=raw_root,
-            file_type="FLAT",
-            output=master_output,
-            master_files=str(master_output),
-            no_bias=flat_no_bias,
-            dark_scale=flat_dark_scale,
-            debug=debug,
-            mem_limit=None,
-        )
+        create_master_file(dir_path=raw_root, file_type="FLAT", output=master_output, master_files=str(master_output),
+            no_bias=flat_no_bias, dark_scale=flat_dark_scale, debug=debug, mem_limit=None, )
 
     # 4) Calibrate science frames
     if cfg.has_section("CALIBRATION"):
-        calibrate_files(
-            input_dir=input_root,
-            file_type=file_type,
-            output_dir=output_dir,
-            master_files=master_files,
-            no_bias=cal_no_bias,
-            dark_scale=cal_dark_scale,
-            debug=debug,
-        )
+        calibrate_files(input_dir=input_root, file_type=file_type, output_dir=output_dir, master_files=master_files,
+            no_bias=cal_no_bias, dark_scale=cal_dark_scale, debug=debug,)
 
 
 if __name__ == "__main__":

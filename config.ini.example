@@ -1,0 +1,39 @@
+[GENERAL]
+debug = yes
+
+[MASTERS]
+# Root directory where you have the BIAS/DARK/FLAT sub folders with raw
+raw_root = ./raw
+
+# Where are the masters saved
+master_output = ./masters
+
+# Building master BIAS
+build_bias = yes
+
+# Building master DARK
+build_dark = yes
+dark_no_bias = no
+dark_scale = no
+
+# Building master FLAT
+build_flat = yes
+flat_no_bias = no
+flat_dark_scale = no
+
+[CALIBRATION]
+# The type of scientific frames (IMAGETYP in the header), e.g. LIGHT, OBJECT, etc.
+file_type = LIGHT
+
+# Root directory with subfolder <file_type> (ex: ./raw/LIGHT)
+input_root = ./raw
+
+# Where to write calibrated FITS
+output_dir = ./calibrated
+
+# Where are the masters read from (folder or files)
+master_files = ./masters
+
+# Calibration options
+no_bias = no
+dark_scale = no
