@@ -28,8 +28,8 @@ def _get_bool(cfg, section, option, default=False):
 
 def _resolve_cfg_path(cfg, section, option, fallback, base_dir: Path) -> Path:
     """
-    Citește o cale din config și, dacă este relativă,
-    o face relativă la directorul fișierului config.
+    Reads a path from config and, if it is relative,
+    makes it relative to the config file directory.
     """
     val = cfg.get(section, option, fallback=fallback).strip()
     p = Path(val)
