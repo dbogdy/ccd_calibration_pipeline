@@ -730,22 +730,15 @@ def create_master_file(
 
         try:
             master.data = master.data.astype(np.float32, copy=False)
-            master.to_hdu().writeto(out_name, overwrite=True)
+            primary_hdu = fits.PrimaryHDU(
+                data=master.data,
+                header=fits.Header(master.meta),
+            )
+            fits.HDUList([primary_hdu]).writeto(out_name, overwrite=True)
             logger.info("Created master file %s from %d files", out_name, len(ccd_list))
             created.append(out_name)
         except Exception:
             logger.exception("Failed writing master to %s", out_name)
-            try:
-                hdu = master.to_hdu()
-                if isinstance(hdu, list) or isinstance(hdu, fits.HDUList):
-                    primary_hdu = hdu[0]
-                else:
-                    primary_hdu = hdu
-                fits.HDUList([primary_hdu]).writeto(out_name, overwrite=True)
-                logger.info("Created master file %s from %d files", out_name, len(ccd_list))
-                created.append(out_name)
-            except Exception:
-                logger.exception("Failed writing master to %s (fallback also failed)", out_name)
     return created
 
 
