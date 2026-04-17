@@ -75,6 +75,8 @@ def main(config_path: Union[str, Path] = "config.ini") -> None:
     flat_dark_scale = _get_bool(cfg, "MASTERS", "flat_dark_scale", default=False)
 
     # ---------- Calibration options ----------
+    run_calibration = _get_bool(cfg, "CALIBRATION", "run_calibration", default=True)
+
     file_type = cfg.get("CALIBRATION", "file_type", fallback="LIGHT").strip().upper()
     input_root = _resolve_cfg_path(cfg, "CALIBRATION", "input_root", "./raw", config_dir)
     output_dir = _resolve_cfg_path(cfg, "CALIBRATION", "output_dir", "./calibrated", config_dir)
@@ -135,7 +137,7 @@ def main(config_path: Union[str, Path] = "config.ini") -> None:
         )
 
     # 4) Calibrate science frames
-    if cfg.has_section("CALIBRATION"):
+    if cfg.has_section("CALIBRATION") and run_calibration:
         calibrate_files(
             input_dir=input_root,
             file_type=file_type,

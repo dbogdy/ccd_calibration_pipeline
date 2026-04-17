@@ -49,7 +49,7 @@ from typing import (
 import numpy as np
 from astropy.io import fits
 import astropy.units as u
-from astropy.stats import SigmaClip, mad_std
+from astropy.stats import mad_std
 from ccdproc import CCDData, combine, subtract_bias, subtract_dark, flat_correct
 
 logger = logging.getLogger(__name__)
@@ -375,9 +375,44 @@ def _add_history(meta: Any, text: str) -> None:
         meta["HISTORY"] = [str(prev), text]
 
 
+def _get_fits_unit(header: Any) -> u.Unit:
+    """
+    Determine the physical unit from a FITS header BUNIT keyword.
+
+    Falls back to ADU if BUNIT is absent, empty, or unrecognized by astropy.
+
+    Parameters
+    ----------
+    header : fits.Header or dict-like
+        Primary HDU header.
+
+    Returns
+    -------
+    astropy.units.Unit
+    """
+    bunit = None
+    if hasattr(header, "get"):
+        bunit = header.get("BUNIT")
+
+    if bunit:
+        bunit_str = str(bunit).strip()
+        if bunit_str:
+            try:
+                return u.Unit(bunit_str)
+            except ValueError:
+                logger.warning(
+                    "Unrecognized BUNIT '%s', falling back to ADU", bunit_str
+                )
+
+    return u.adu
+
+
 def _to_ccd(hdu: Union[fits.HDUList, fits.hdu.image.PrimaryHDU]) -> CCDData:
     """
-    Convert a PrimaryHDU or HDUList to CCDData in ADU with float32 data.
+    Convert a PrimaryHDU or HDUList to CCDData in float32.
+
+    The physical unit is read from the BUNIT header keyword.
+    Falls back to ADU if BUNIT is absent or unrecognized.
 
     If HDUList is provided, the primary HDU is used.
     """
@@ -386,10 +421,11 @@ def _to_ccd(hdu: Union[fits.HDUList, fits.hdu.image.PrimaryHDU]) -> CCDData:
     if data is None:
         raise ValueError("HDU data is None")
     header = getattr(primary, "header", {})
+    unit = _get_fits_unit(header)
     return CCDData(
         data.astype(np.float32, copy=False),
         meta=header,
-        unit=u.adu,
+        unit=unit,
     )
 
 
@@ -462,8 +498,6 @@ def create_master_file(
     master_groups = grouping(master_paths) if master_paths else {}
 
     created: List[Path] = []
-
-    sigma = SigmaClip(sigma=3.0, maxiters=5)
 
     for (ftype, binning, gain, exposure, temperature), file_list in groups.items():
         # Only process frames whose IMAGETYP matches requested file_type.
@@ -542,7 +576,9 @@ def create_master_file(
         # Configure combine() keyword arguments.
         combine_kwargs: Dict[str, Any] = dict(
             method="median",
-            sigma_clip=sigma,
+            sigma_clip=True,
+            sigma_clip_low_thresh=3,
+            sigma_clip_high_thresh=3,
             sigma_clip_func=np.ma.median,
             sigma_clip_dev_func=mad_std,
         )
@@ -568,16 +604,15 @@ def create_master_file(
                     return 1.0
                 return float(1.0 / med)
 
-            # Configure combine parameters with proper types
-            combine_kwargs_flat = {
-                "method": "median",  # str
-                "scale": inv_median,  # Callable
-                "sigma_clip": True,  # bool
-                "sigma_clip_low_thresh": 3,  # int
-                "sigma_clip_high_thresh": 3,  # int
-                "sigma_clip_func": np.ma.median,  # Callable
-                "sigma_clip_dev_func": mad_std,  # Callable
-            }
+            combine_kwargs_flat: Dict[str, Any] = dict(
+                method="median",
+                scale=inv_median,
+                sigma_clip=True,
+                sigma_clip_low_thresh=3,
+                sigma_clip_high_thresh=3,
+                sigma_clip_func=np.ma.median,
+                sigma_clip_dev_func=mad_std,
+            )
             if mem_limit is not None:
                 combine_kwargs_flat["mem_limit"] = float(mem_limit)
 
@@ -763,7 +798,6 @@ def calibrate_files(
                     flat_data = np.asarray(master_flat.data, dtype=float)
                     finite = flat_data[np.isfinite(flat_data)]
                     if finite.size > 0:
-                        # e.g. 1% from median value finite
                         flat_floor = max(1e-6, 0.01 * float(np.median(finite)))
                     else:
                         flat_floor = 1e-6
