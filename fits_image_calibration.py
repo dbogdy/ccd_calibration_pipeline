@@ -422,6 +422,26 @@ def _normalize_master_paths(
     return out
 
 
+def _add_history(meta: Any, text: str) -> None:
+    """
+    Append a HISTORY entry to FITS-like metadata.
+
+    Supports both astropy.io.fits.Header (via add_history)
+    and dict-like containers.
+    """
+    if hasattr(meta, "add_history"):
+        meta.add_history(text)
+        return
+
+    prev = meta.get("HISTORY")
+    if prev is None:
+        meta["HISTORY"] = [text]
+    elif isinstance(prev, list):
+        prev.append(text)
+    else:
+        meta["HISTORY"] = [str(prev), text]
+
+
 def _inv_median(ccd_obj: CCDData) -> float:
     """Scale factor for flat combination: 1 / median(frame)."""
     arr = np.ma.array(ccd_obj.data)
