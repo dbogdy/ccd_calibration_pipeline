@@ -21,6 +21,10 @@ build_flat = yes
 flat_no_bias = no
 flat_dark_scale = no
 
+# Memory limit for frame combination (MB). Increase for faster processing
+# if you have enough RAM, decrease if you get out-of-memory errors.
+mem_limit_mb = 2048
+
 [CALIBRATION]
 # Run calibration of science frames (yes/no)
 run_calibration = yes

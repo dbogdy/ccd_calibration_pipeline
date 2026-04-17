@@ -321,6 +321,73 @@ def _find_single_match(
     return sorted(files, key=lambda t: t[0].stat().st_mtime, reverse=True)[0]
 
 
+def _find_single_match_interactive(
+    master_groups: GroupMap,
+    want_type: str,
+    binning: Tuple[Optional[int], Optional[int]],
+    gain: Optional[int],
+    exposure: Optional[float],
+    temp: Optional[float],
+    tol_exp_rel: float = 1e-6,
+    tol_temp_abs: float = 2.0,
+) -> Optional[Tuple[Path, fits.Header]]:
+    """
+    Wrapper over _find_single_match that handles ambiguous matches interactively.
+
+    If multiple compatible masters exist, lists them and asks the user
+    to pick one via stdin. Blocks until a valid choice is entered.
+
+    Returns
+    -------
+    (Path, Header) or None
+    """
+    try:
+        return _find_single_match(
+            master_groups, want_type, binning, gain, exposure, temp,
+            tol_exp_rel, tol_temp_abs,
+        )
+    except RuntimeError:
+        # Collect all candidate keys manually to show the user
+        candidate_files: List[Tuple[Path, fits.Header]] = []
+        for key, file_list in master_groups.items():
+            m_type, m_bin, m_gain, m_exp, m_temp = key
+            if m_type != want_type:
+                continue
+            if m_bin != binning:
+                continue
+            if m_gain != gain:
+                continue
+            if want_type == "DARK":
+                if m_exp is None or exposure is None:
+                    continue
+                if not math.isclose(m_exp, exposure, rel_tol=tol_exp_rel):
+                    continue
+            if m_temp is not None and temp is not None:
+                if abs(m_temp - temp) > tol_temp_abs:
+                    continue
+            candidate_files.extend(file_list)
+
+        print(
+            f"\n[AMBIGUOUS] Multiple master {want_type} files found "
+            f"for bin={binning} gain={gain} exp={exposure} temp={temp}:"
+        )
+        for i, (fpath, _) in enumerate(candidate_files):
+            print(f"  [{i + 1}] {fpath}")
+
+        while True:
+            try:
+                raw = input(f"Select master {want_type} [1-{len(candidate_files)}]: ").strip()
+                idx = int(raw) - 1
+                if 0 <= idx < len(candidate_files):
+                    chosen = candidate_files[idx]
+                    print(f"  -> Using: {chosen[0]}")
+                    return chosen
+                else:
+                    print(f"  Invalid choice. Enter a number between 1 and {len(candidate_files)}.")
+            except (ValueError, EOFError):
+                print("  Invalid input. Enter a number.")
+
+
 def _normalize_master_paths(
     master_files: Optional[Union[str, Path, Iterable[Union[str, Path]]]],
 ) -> List[Path]:
@@ -355,7 +422,16 @@ def _normalize_master_paths(
     return out
 
 
-def _add_history(meta: Any, text: str) -> None:
+def _inv_median(ccd_obj: CCDData) -> float:
+    """Scale factor for flat combination: 1 / median(frame)."""
+    arr = np.ma.array(ccd_obj.data)
+    med = np.ma.median(arr)
+    if np.ma.is_masked(med) or float(med) == 0.0:
+        return 1.0
+    return float(1.0 / med)
+
+
+
     """
     Append a HISTORY entry to FITS-like metadata.
 
@@ -596,17 +672,9 @@ def create_master_file(
                 _add_history(master.meta, f"Combined from {len(ccd_list)} files")
 
         elif file_type_norm == "FLAT":
-            # Scale each flat frame by inverse median to normalize illumination.
-            def inv_median(ccd_obj: CCDData) -> float:
-                arr = np.ma.array(ccd_obj.data)
-                med = np.ma.median(arr)
-                if np.ma.is_masked(med) or float(med) == 0.0:
-                    return 1.0
-                return float(1.0 / med)
-
             combine_kwargs_flat: Dict[str, Any] = dict(
                 method="median",
-                scale=inv_median,
+                scale=_inv_median,
                 sigma_clip=True,
                 sigma_clip_low_thresh=3,
                 sigma_clip_high_thresh=3,
@@ -642,31 +710,22 @@ def create_master_file(
 
         try:
             master.data = master.data.astype(np.float32, copy=False)
-            master.to_hdu().writeto(
-                out_name,
-                overwrite=True,
-            )
+            master.to_hdu().writeto(out_name, overwrite=True)
             logger.info("Created master file %s from %d files", out_name, len(ccd_list))
             created.append(out_name)
         except Exception:
             logger.exception("Failed writing master to %s", out_name)
-            # Save only the primary HDU (hdu[0]) without mask and uncertainties
             try:
                 hdu = master.to_hdu()
                 if isinstance(hdu, list) or isinstance(hdu, fits.HDUList):
                     primary_hdu = hdu[0]
                 else:
                     primary_hdu = hdu
-                fits.HDUList([primary_hdu]).writeto(
-                    out_name,
-                    overwrite=True,
-                )
-                logger.info(
-                    "Created master file %s from %d files", out_name, len(ccd_list)
-                )
+                fits.HDUList([primary_hdu]).writeto(out_name, overwrite=True)
+                logger.info("Created master file %s from %d files", out_name, len(ccd_list))
                 created.append(out_name)
             except Exception:
-                logger.exception("Failed writing master to %s", out_name)
+                logger.exception("Failed writing master to %s (fallback also failed)", out_name)
     return created
 
 
@@ -742,12 +801,12 @@ def calibrate_files(
         bias_match = (
             None
             if no_bias
-            else _find_single_match(master_groups, "BIAS", binning, gain, None, None)
+            else _find_single_match_interactive(master_groups, "BIAS", binning, gain, None, None)
         )
-        dark_match = _find_single_match(
+        dark_match = _find_single_match_interactive(
             master_groups, "DARK", binning, gain, exposure, temperature
         )
-        flat_match = _find_single_match(
+        flat_match = _find_single_match_interactive(
             master_groups, "FLAT", binning, gain, None, None
         )
 
@@ -769,6 +828,8 @@ def calibrate_files(
             flat_path, _ = flat_match
             with fits.open(flat_path) as hdul:
                 master_flat = _to_ccd(hdul)
+
+        output_dir.mkdir(parents=True, exist_ok=True)
 
         for fp, _ in file_list:
             try:
@@ -808,8 +869,6 @@ def calibrate_files(
                     )
                 else:
                     logger.warning("Missing FLAT for %s", fp)
-
-                output_dir.mkdir(parents=True, exist_ok=True)
 
                 out_path = output_dir / f"{Path(fp).stem}_cal.fits"
                 ccd.data = ccd.data.astype(np.float32, copy=False)

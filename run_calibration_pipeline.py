@@ -74,6 +74,9 @@ def main(config_path: Union[str, Path] = "config.ini") -> None:
     flat_no_bias    = _get_bool(cfg, "MASTERS", "flat_no_bias", default=False)
     flat_dark_scale = _get_bool(cfg, "MASTERS", "flat_dark_scale", default=False)
 
+    mem_limit_mb = cfg.getint("MASTERS", "mem_limit_mb", fallback=2048)
+    mem_limit = mem_limit_mb * 1024 * 1024
+
     # ---------- Calibration options ----------
     run_calibration = _get_bool(cfg, "CALIBRATION", "run_calibration", default=True)
 
@@ -107,7 +110,7 @@ def main(config_path: Union[str, Path] = "config.ini") -> None:
             no_bias=True,
             dark_scale=False,
             debug=debug,
-            mem_limit=None,
+            mem_limit=mem_limit,
         )
 
     # 2) Build master DARK
@@ -120,7 +123,7 @@ def main(config_path: Union[str, Path] = "config.ini") -> None:
             no_bias=dark_no_bias,
             dark_scale=dark_scale,
             debug=debug,
-            mem_limit=None,
+            mem_limit=mem_limit,
         )
 
     # 3) Build master FLAT
@@ -133,7 +136,7 @@ def main(config_path: Union[str, Path] = "config.ini") -> None:
             no_bias=flat_no_bias,
             dark_scale=flat_dark_scale,
             debug=debug,
-            mem_limit=None,
+            mem_limit=mem_limit,
         )
 
     # 4) Calibrate science frames
