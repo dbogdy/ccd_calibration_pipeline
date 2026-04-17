@@ -22,6 +22,9 @@ flat_no_bias = no
 flat_dark_scale = no
 
 [CALIBRATION]
+# Run calibration of science frames (yes/no)
+run_calibration = yes
+
 # The type of scientific frames (IMAGETYP in the header), e.g. LIGHT, OBJECT, etc.
 file_type = LIGHT
 
