@@ -876,7 +876,7 @@ def calibrate_files(
                     else:
                         flat_floor = 1e-6
 
-                    ccd = flat_correct(ccd, master_flat, min_value=flat_floor)
+                    ccd = flat_correct(ccd, master_flat, min_value=flat_floor, norm_value=1.0)
                     _add_history(
                         ccd.meta, f"Flat-field corrected (min_value={flat_floor:.3g})"
                     )
