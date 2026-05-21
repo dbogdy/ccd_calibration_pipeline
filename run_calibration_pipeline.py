@@ -13,6 +13,7 @@ Usage
     python run_calibration_pipeline.py my.cfg     # uses custom config file
 """
 
+import logging
 import sys
 import configparser
 from pathlib import Path
@@ -87,7 +88,7 @@ def main(config_path: Union[str, Path] = "config.ini") -> None:
     master_files_str = cfg.get("CALIBRATION", "master_files", fallback=str(master_output))
     master_files_raw = [p.strip() for p in master_files_str.split(",") if p.strip()]
 
-    # rezolvăm și master_files relativ la config_dir
+    # resolve master_files paths relative to config_dir
     master_files = []
     for s in master_files_raw:
         p = Path(s)
@@ -97,8 +98,16 @@ def main(config_path: Union[str, Path] = "config.ini") -> None:
             p = p.resolve()
         master_files.append(str(p))
 
-    cal_no_bias   = _get_bool(cfg, "CALIBRATION", "no_bias", default=False)
+    cal_no_bias    = _get_bool(cfg, "CALIBRATION", "no_bias", default=False)
     cal_dark_scale = _get_bool(cfg, "CALIBRATION", "dark_scale", default=False)
+
+    fix_hot_pixels  = _get_bool(cfg, "CALIBRATION", "fix_hot_pixels",  default=True)
+    hot_pixel_sigma = cfg.getfloat("CALIBRATION", "hot_pixel_sigma", fallback=5.0)
+
+    fix_cosmic_rays = _get_bool(cfg, "CALIBRATION", "fix_cosmic_rays", default=True)
+    cr_sigclip      = cfg.getfloat("CALIBRATION", "cr_sigclip",      fallback=4.5)
+    cr_objlim       = cfg.getfloat("CALIBRATION", "cr_objlim",       fallback=5.0)
+    cr_readnoise    = cfg.getfloat("CALIBRATION", "cr_readnoise",    fallback=8.0)
 
     # 1) Build master BIAS
     if build_bias:
@@ -149,10 +158,21 @@ def main(config_path: Union[str, Path] = "config.ini") -> None:
             no_bias=cal_no_bias,
             dark_scale=cal_dark_scale,
             debug=debug,
+            fix_hot_pixels=fix_hot_pixels,
+            hot_pixel_sigma=hot_pixel_sigma,
+            fix_cosmic_rays=fix_cosmic_rays,
+            cr_sigclip=cr_sigclip,
+            cr_objlim=cr_objlim,
+            cr_readnoise=cr_readnoise,
         )
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(levelname)s] %(message)s",
+        stream=sys.stderr,
+    )
     # Allow optional custom config path as first CLI argument.
     if len(sys.argv) > 1:
         main(sys.argv[1])

@@ -6,20 +6,24 @@ CCD calibration utilities for building master calibration frames
 
 Features
 --------
-- Robust grouping of FITS frames by:
-    (IMAGETYP, (XBINNING, YBINNING), GAIN, EXPTIME, rounded CCD-TEMP).
+- Robust grouping of FITS frames by header keywords:
+    (IMAGETYP, (XBINNING, YBINNING), GAIN, EXPTIME, rounded CCD-TEMP, FILTER).
 - Temperature rounding with configurable step and tolerance reuse.
 - Master selection with exposure- and temperature-matching tolerances.
 - Sigma-clipped median combination with MAD-based dispersion.
 - Optional use of existing masters for pre-correction.
-- Science calibration pipeline: [bias] -> dark -> flat.
+- Science calibration pipeline: [bias] -> dark -> flat -> hot pixels -> cosmic rays.
+- Hot pixel detection via sigma_clipped_stats; 3×3 neighbour median interpolation.
+- Cosmic ray rejection via L.A.Cosmic (ccdproc.cosmicray_lacosmic).
 - I/O in float32 to reduce memory footprint.
+- All metadata read exclusively from FITS headers (no filename parsing).
 
 Dependencies
 ------------
 - numpy
 - astropy (io.fits, units, stats)
-- ccdproc (CCDData, combine, subtract_bias, subtract_dark, flat_correct)
+- ccdproc (CCDData, combine, subtract_bias, subtract_dark, flat_correct,
+           cosmicray_lacosmic)
 
 This module is intended to be imported and called from a separate driver
 script or notebook.
@@ -50,18 +54,22 @@ import numpy as np
 from astropy.io import fits
 import astropy.units as u
 from astropy.stats import mad_std
-from ccdproc import CCDData, combine, subtract_bias, subtract_dark, flat_correct
+from ccdproc import (
+    CCDData, combine, subtract_bias, subtract_dark, flat_correct,
+    cosmicray_lacosmic,
+)
 
 logger = logging.getLogger(__name__)
 
 # Key:
-# (IMAGETYP, (XBINNING, YBINNING), GAIN, EXPTIME, CCD-TEMP-rounded)
+# (IMAGETYP, (XBINNING, YBINNING), GAIN, EXPTIME, CCD-TEMP-rounded, FILTER)
 NumberKey = Tuple[
     str,
     Tuple[Optional[int], Optional[int]],
     Optional[int],
     Optional[float],
     Optional[float],
+    Optional[str],   # FILTER — populated for FLAT frames; None for BIAS/DARK
 ]
 GroupMap = Dict[NumberKey, List[Tuple[Path, fits.Header]]]
 
@@ -90,7 +98,8 @@ def _enable_debug_logger() -> None:
 
 
 def load_files(
-    directory: Union[str, Path], extensions: Sequence[str] = ("*.fit", "*.fits")
+    directory: Union[str, Path],
+    extensions: Sequence[str] = ("*.fit", "*.fits", "*.FIT", "*.FITS"),
 ) -> List[Path]:
     """
     Recursively collect FITS files from a directory.
@@ -158,6 +167,22 @@ def _float_str(v: Optional[float], fmt: str = ".3g") -> str:
     return f"{v:{fmt}}" if v is not None else "NA"
 
 
+def _get_object_name(file_path: Path, base_dir: Path) -> Optional[str]:
+    """
+    Return the immediate subdirectory name of file_path relative to base_dir.
+
+    E.g.  raw/LIGHT/NGC1234/img.fits  ->  'NGC1234'
+    Returns None if the file is directly inside base_dir.
+    """
+    try:
+        rel = file_path.relative_to(base_dir)
+        if len(rel.parts) > 1:
+            return rel.parts[0]
+    except ValueError:
+        pass
+    return None
+
+
 def grouping(
     file_list: Iterable[Union[Path, str]],
     temp_tolerance: float = 2.0,
@@ -167,7 +192,14 @@ def grouping(
     Group FITS files based on header keywords.
 
     Group key:
-        (IMAGETYP, (XBINNING, YBINNING), GAIN, EXPTIME, rounded CCD-TEMP)
+        (IMAGETYP, (XBINNING, YBINNING), GAIN, EXPTIME, rounded CCD-TEMP, FILTER)
+
+    FILTER handling:
+        - All metadata is read exclusively from FITS headers; filenames are
+          never parsed and files are never modified by this function.
+        - For FLAT/LIGHT frames: FILTER keyword is used as-is; defaults to
+          "Clear" when the keyword is absent.
+        - For BIAS and DARK, FILTER is always None in the key.
 
     CCD-TEMP handling:
         - Temperature is rounded using 'round_step'.
@@ -210,15 +242,25 @@ def grouping(
             exposure = _safe_float(header.get("EXPTIME"))
             temperature = _round_temp(header.get("CCD-TEMP"), step=round_step)
 
+            # FILTER is read exclusively from the FITS header.
+            # BIAS and DARK frames never carry a filter value.
+            # For FLAT/LIGHT frames, default to "Clear" when the keyword is absent.
+            filter_name: Optional[str] = None
+            if filetype not in {"BIAS", "DARK"}:
+                header_filter = str(header.get("FILTER", "")).strip()
+                filter_name = header_filter if header_filter else "Clear"
+
             matched_key: Optional[NumberKey] = None
 
             # Search for an existing compatible key within temperature tolerance.
-            for k_type, k_bin, k_gain, k_exp, k_temp in list(groups.keys()):
+            for k_type, k_bin, k_gain, k_exp, k_temp, k_filter in list(groups.keys()):
                 if k_type != filetype:
                     continue
                 if k_bin != binning:
                     continue
                 if k_gain != gain:
+                    continue
+                if k_filter != filter_name:
                     continue
 
                 # Exposure must match (if both present) for DARK; for others we
@@ -233,7 +275,7 @@ def grouping(
                     continue
 
                 if abs(k_temp - temperature) <= temp_tolerance:
-                    matched_key = (k_type, k_bin, k_gain, k_exp, k_temp)
+                    matched_key = (k_type, k_bin, k_gain, k_exp, k_temp, k_filter)
                     break
 
             key: NumberKey = matched_key or (
@@ -242,6 +284,7 @@ def grouping(
                 gain,
                 exposure,
                 temperature,
+                filter_name,
             )
             groups[key].append((file, header))
 
@@ -260,6 +303,7 @@ def _find_single_match(
     gain: Optional[int],
     exposure: Optional[float],
     temp: Optional[float],
+    filter_name: Optional[str] = None,
     tol_exp_rel: float = 1e-6,
     tol_temp_abs: float = 2.0,
 ) -> Optional[Tuple[Path, fits.Header]]:
@@ -272,6 +316,7 @@ def _find_single_match(
     - Exact binning and gain
     - For DARK: exposure must match within tol_exp_rel
     - For BIAS/FLAT: exposure not constrained (unique solution assumed)
+    - For FLAT: filter_name must match exactly
     - If both master and target have CCD-TEMP: |ΔT| <= tol_temp_abs
 
     If multiple keys are compatible, raise RuntimeError to avoid ambiguity.
@@ -283,7 +328,7 @@ def _find_single_match(
     """
     candidate_keys: List[NumberKey] = []
 
-    for m_type, m_bin, m_gain, m_exp, m_temp in master_groups.keys():
+    for m_type, m_bin, m_gain, m_exp, m_temp, m_filter in master_groups.keys():
         if m_type != want_type:
             continue
         if m_bin != binning:
@@ -297,18 +342,23 @@ def _find_single_match(
             if not math.isclose(m_exp, exposure, rel_tol=tol_exp_rel):
                 continue
 
+        if want_type == "FLAT":
+            if m_filter != filter_name:
+                continue
+
         if m_temp is not None and temp is not None:
             if abs(m_temp - temp) > tol_temp_abs:
                 continue
 
-        candidate_keys.append((m_type, m_bin, m_gain, m_exp, m_temp))
+        candidate_keys.append((m_type, m_bin, m_gain, m_exp, m_temp, m_filter))
 
     if not candidate_keys:
         return None
 
     if len(candidate_keys) > 1:
         raise RuntimeError(
-            f"Multiple master {want_type} keys for bin={binning} gain={gain}"
+            f"Multiple master {want_type} keys for "
+            f"bin={binning} gain={gain} exp={exposure} temp={temp} filter={filter_name}"
         )
 
     key = candidate_keys[0]
@@ -328,6 +378,7 @@ def _find_single_match_interactive(
     gain: Optional[int],
     exposure: Optional[float],
     temp: Optional[float],
+    filter_name: Optional[str] = None,
     tol_exp_rel: float = 1e-6,
     tol_temp_abs: float = 2.0,
 ) -> Optional[Tuple[Path, fits.Header]]:
@@ -344,13 +395,13 @@ def _find_single_match_interactive(
     try:
         return _find_single_match(
             master_groups, want_type, binning, gain, exposure, temp,
-            tol_exp_rel, tol_temp_abs,
+            filter_name, tol_exp_rel, tol_temp_abs,
         )
     except RuntimeError:
         # Collect all candidate keys manually to show the user
         candidate_files: List[Tuple[Path, fits.Header]] = []
         for key, file_list in master_groups.items():
-            m_type, m_bin, m_gain, m_exp, m_temp = key
+            m_type, m_bin, m_gain, m_exp, m_temp, m_filter = key
             if m_type != want_type:
                 continue
             if m_bin != binning:
@@ -362,6 +413,9 @@ def _find_single_match_interactive(
                     continue
                 if not math.isclose(m_exp, exposure, rel_tol=tol_exp_rel):
                     continue
+            if want_type == "FLAT":
+                if m_filter != filter_name:
+                    continue
             if m_temp is not None and temp is not None:
                 if abs(m_temp - temp) > tol_temp_abs:
                     continue
@@ -369,7 +423,7 @@ def _find_single_match_interactive(
 
         print(
             f"\n[AMBIGUOUS] Multiple master {want_type} files found "
-            f"for bin={binning} gain={gain} exp={exposure} temp={temp}:"
+            f"for bin={binning} gain={gain} exp={exposure} temp={temp} filter={filter_name}:"
         )
         for i, (fpath, _) in enumerate(candidate_files):
             print(f"  [{i + 1}] {fpath}")
@@ -384,8 +438,14 @@ def _find_single_match_interactive(
                     return chosen
                 else:
                     print(f"  Invalid choice. Enter a number between 1 and {len(candidate_files)}.")
-            except (ValueError, EOFError):
-                print("  Invalid input. Enter a number.")
+            except ValueError:
+                print(f"  Invalid input. Enter a number between 1 and {len(candidate_files)}.")
+            except EOFError:
+                chosen = candidate_files[0]
+                logger.warning(
+                    "EOF received during master selection, falling back to: %s", chosen[0]
+                )
+                return chosen
 
 
 def _normalize_master_paths(
@@ -451,26 +511,6 @@ def _inv_median(ccd_obj: CCDData) -> float:
     return float(1.0 / med)
 
 
-
-    """
-    Append a HISTORY entry to FITS-like metadata.
-
-    Supports both astropy.io.fits.Header (via add_history)
-    and dict-like containers.
-    """
-    if hasattr(meta, "add_history"):
-        meta.add_history(text)
-        return
-
-    prev = meta.get("HISTORY")
-    if prev is None:
-        meta["HISTORY"] = [text]
-    elif isinstance(prev, list):
-        prev.append(text)
-    else:
-        meta["HISTORY"] = [str(prev), text]
-
-
 def _get_fits_unit(header: Any) -> u.Unit:
     """
     Determine the physical unit from a FITS header BUNIT keyword.
@@ -523,6 +563,117 @@ def _to_ccd(hdu: Union[fits.HDUList, fits.hdu.image.PrimaryHDU]) -> CCDData:
         meta=header,
         unit=unit,
     )
+
+
+def _make_hot_pixel_mask(
+    master_dark: CCDData,
+    sigma: float = 5.0,
+) -> np.ndarray:
+    """
+    Derive a bad-pixel mask from a master dark frame.
+
+    Uses sigma-clipped statistics so the threshold is robust even when the
+    pixel distribution is highly quantized (MAD = 0).
+
+    Pixels whose value exceeds  clipped_median + sigma * clipped_std  are
+    flagged as hot.
+
+    Returns
+    -------
+    numpy bool array  (True = hot pixel)
+    """
+    from astropy.stats import sigma_clipped_stats
+
+    data = np.asarray(master_dark.data, dtype=np.float64)
+    finite = data[np.isfinite(data)]
+    if finite.size == 0:
+        return np.zeros(data.shape, dtype=bool)
+
+    _, med_clipped, std_clipped = sigma_clipped_stats(finite, sigma=3.0, maxiters=5)
+    # Guard against degenerate case where clipped std is still near zero
+    if std_clipped < 1e-6:
+        std_clipped = float(np.std(finite))
+    threshold = float(med_clipped) + sigma * float(std_clipped)
+    mask      = data > threshold
+    logger.debug(
+        "Hot pixel mask: median=%.3f  clipped_std=%.4f  threshold=%.3f  "
+        "flagged=%d / %d (%.3f%%)",
+        med_clipped, std_clipped, threshold,
+        int(mask.sum()), mask.size,
+        100.0 * mask.sum() / mask.size,
+    )
+    return mask
+
+
+def _interpolate_bad_pixels(
+    data: np.ndarray,
+    mask: np.ndarray,
+) -> np.ndarray:
+    """
+    Replace each masked pixel with the median of its valid 3×3 neighbours.
+
+    Pixels with no valid neighbour are left unchanged.
+
+    Returns
+    -------
+    float32 array with bad pixels interpolated in-place copy.
+    """
+    if not mask.any():
+        return data.astype(np.float32, copy=True)
+
+    out = data.astype(np.float32, copy=True)
+    h, w = data.shape
+    bad_rows, bad_cols = np.where(mask)
+
+    for r, c in zip(bad_rows.tolist(), bad_cols.tolist()):
+        r0, r1 = max(0, r - 1), min(h, r + 2)
+        c0, c1 = max(0, c - 1), min(w, c + 2)
+        patch      = out[r0:r1, c0:c1]
+        patch_mask = mask[r0:r1, c0:c1].copy()
+        patch_mask[r - r0, c - c0] = True          # exclude the pixel itself
+        valid = patch[~patch_mask]
+        if valid.size > 0:
+            out[r, c] = float(np.median(valid))
+
+    return out
+
+
+def _apply_cosmicray_rejection(
+    ccd:       CCDData,
+    gain:      float = 1.0,
+    readnoise: float = 8.0,
+    sigclip:   float = 4.5,
+    objlim:    float = 5.0,
+) -> Tuple[CCDData, int]:
+    """
+    Run L.A.Cosmic cosmic-ray detection on a calibrated frame.
+
+    Parameters
+    ----------
+    ccd       : calibrated CCDData (bias+dark+flat corrected)
+    gain      : CCD gain [e⁻/ADU]  — read from EGAIN header keyword (falls back to GAIN)
+    readnoise : read noise [e⁻]    — read from RDNOISE or config default
+    sigclip   : detection threshold in sigma above background
+    objlim    : minimum contrast between CR and underlying source
+
+    Returns
+    -------
+    (cleaned_ccd, n_cr_pixels)
+        cleaned_ccd  — CCDData with CR pixels replaced and mask set
+        n_cr_pixels  — number of pixels flagged as cosmic rays
+    """
+    cleaned = cosmicray_lacosmic(
+        ccd,
+        sigclip=float(sigclip),
+        objlim=float(objlim),
+        gain=float(gain),
+        readnoise=float(readnoise),
+        gain_apply=False,   # keep data in ADU
+        verbose=False,
+    )
+    cr_mask = cleaned.mask
+    n_cr    = int(np.sum(cr_mask)) if cr_mask is not None else 0
+    return cleaned, n_cr
 
 
 def create_master_file(
@@ -595,7 +746,7 @@ def create_master_file(
 
     created: List[Path] = []
 
-    for (ftype, binning, gain, exposure, temperature), file_list in groups.items():
+    for (ftype, binning, gain, exposure, temperature, filter_name), file_list in groups.items():
         # Only process frames whose IMAGETYP matches requested file_type.
         if ftype != file_type_norm:
             continue
@@ -708,8 +859,9 @@ def create_master_file(
             if master is not None:
                 _add_history(
                     master.meta,
-                    f"Master FLAT bin={binning} "
-                    f"gain={gain} exp={_float_str(exposure)}s temp={temperature}C",
+                    f"Master FLAT bin={binning} gain={gain} "
+                    f"exp={_float_str(exposure)}s temp={temperature}C "
+                    f"filter={filter_name}",
                 )
                 _add_history(master.meta, f"Combined from {len(ccd_list)} files")
 
@@ -722,10 +874,11 @@ def create_master_file(
         gain_str = f"g{gain}" if gain is not None else "gNA"
         exp_str = f"{_float_str(exposure)}s" if exposure is not None else "sNA"
         temp_str = f"{_float_str(temperature)}C" if temperature is not None else "CNA"
+        filter_str = f"_{filter_name}" if filter_name is not None else ""
 
         out_name = (
             output
-            / f"master_{file_type_norm.lower()}_{bin_str}_{gain_str}_{exp_str}_{temp_str}.fits"
+            / f"master_{file_type_norm.lower()}_{bin_str}_{gain_str}_{exp_str}_{temp_str}{filter_str}.fits"
         )
 
         try:
@@ -750,9 +903,22 @@ def calibrate_files(
     no_bias: bool = False,
     dark_scale: bool = False,
     debug: bool = False,
+    fix_hot_pixels:   bool  = True,
+    hot_pixel_sigma:  float = 5.0,
+    fix_cosmic_rays:  bool  = True,
+    cr_sigclip:       float = 4.5,
+    cr_objlim:        float = 5.0,
+    cr_readnoise:     float = 8.0,
 ) -> List[Path]:
     """
-    Calibrate frames from ``input_dir/<file_type>`` using given master frames.
+    Calibrate frames from ``input_dir/<file_type>/`` using master frames.
+
+    Science frames are discovered recursively under ``input_dir/<file_type>/``.
+    The immediate subdirectory name is used as the object name.
+
+    Output layout
+    -------------
+    ``output_dir/<object>/<filter>/filename_cal.fits``
 
     Calibration sequence
     --------------------
@@ -760,20 +926,17 @@ def calibrate_files(
         1. Subtract master bias (if available and not no_bias).
         2. Subtract master dark (matched in exposure and temperature).
         3. Apply flat-field correction.
-
-    Master selection
-    ----------------
-    Masters are discovered from ``master_files`` (file, directory,
-    or iterable of paths), grouped with the same rules as raw frames.
+        4. Interpolate hot pixels detected from master dark (if fix_hot_pixels).
+        5. Reject cosmic rays using L.A.Cosmic (if fix_cosmic_rays).
 
     Parameters
     ----------
     input_dir : str or Path
-        Root directory containing subdirectories by IMAGETYP.
+        Root directory containing ``<file_type>/<object>/`` subdirectories.
     file_type : str
-        Science-like image type to calibrate (e.g. 'LIGHT', 'OBJECT').
+        Science image type to calibrate (e.g. 'LIGHT').
     output_dir : str or Path
-        Output directory for calibrated FITS files.
+        Root output directory for calibrated FITS files.
     master_files : path-like or iterable
         Master calibration frames (or directory containing them).
     no_bias : bool
@@ -782,6 +945,18 @@ def calibrate_files(
         If True, scale master darks by exposure time in subtract_dark.
     debug : bool
         If True, enable verbose logging.
+    fix_hot_pixels : bool
+        Detect hot pixels from master dark and interpolate them in each frame.
+    hot_pixel_sigma : float
+        Threshold multiplier for hot pixel detection: clipped_median + sigma * clipped_std.
+    fix_cosmic_rays : bool
+        Run L.A.Cosmic cosmic-ray rejection on each calibrated frame.
+    cr_sigclip : float
+        L.A.Cosmic detection threshold [sigma above background].
+    cr_objlim : float
+        L.A.Cosmic minimum contrast between CR and underlying source.
+    cr_readnoise : float
+        Default read noise [e⁻] used when RDNOISE is absent from the header.
 
     Returns
     -------
@@ -794,8 +969,9 @@ def calibrate_files(
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
     file_type_norm = str(file_type).strip().upper()
+    light_base = input_dir / file_type_norm
 
-    files = load_files(input_dir / file_type_norm, ("*.fit", "*.fits"))
+    files = load_files(light_base, ("*.fit", "*.fits"))
     groups = grouping(files)
 
     master_paths = _normalize_master_paths(master_files)
@@ -803,12 +979,14 @@ def calibrate_files(
 
     created: List[Path] = []
 
-    for (imagetyp, binning, gain, exposure, temperature), file_list in groups.items():
+    for (imagetyp, binning, gain, exposure, temperature, filter_name), file_list in groups.items():
         # Only treat frames whose header IMAGETYP matches requested file_type.
         if imagetyp != file_type_norm:
             continue
         if not file_list:
             continue
+
+        filter_label = filter_name if filter_name is not None else "nofilter"
 
         # Find best master matches for this group.
         bias_match = (
@@ -820,12 +998,14 @@ def calibrate_files(
             master_groups, "DARK", binning, gain, exposure, temperature
         )
         flat_match = _find_single_match_interactive(
-            master_groups, "FLAT", binning, gain, None, None
+            master_groups, "FLAT", binning, gain, None, None,
+            filter_name=filter_name,
         )
 
         master_bias = None
         master_dark = None
         master_flat = None
+        dark_path: Optional[Path] = None
 
         if bias_match:
             bias_path, _ = bias_match
@@ -842,7 +1022,15 @@ def calibrate_files(
             with fits.open(flat_path) as hdul:
                 master_flat = _to_ccd(hdul)
 
-        output_dir.mkdir(parents=True, exist_ok=True)
+        # Build hot pixel mask once per group from the matching master dark.
+        hot_mask: Optional[np.ndarray] = None
+        if fix_hot_pixels and master_dark is not None:
+            hot_mask = _make_hot_pixel_mask(master_dark, sigma=hot_pixel_sigma)
+            logger.info(
+                "  Hot pixel mask: %d pixels (sigma=%.1f) from %s",
+                int(hot_mask.sum()), hot_pixel_sigma,
+                dark_path.name if dark_path is not None else "unknown",
+            )
 
         for fp, _ in file_list:
             try:
@@ -868,22 +1056,53 @@ def calibrate_files(
                     logger.warning("Missing DARK for %s", fp)
 
                 if master_flat is not None:
-                    # Set a floor to avoid division by zero / dead pixels
                     flat_data = np.asarray(master_flat.data, dtype=float)
                     finite = flat_data[np.isfinite(flat_data)]
-                    if finite.size > 0:
-                        flat_floor = max(1e-6, 0.01 * float(np.median(finite)))
-                    else:
-                        flat_floor = 1e-6
-
+                    flat_floor = max(1e-6, 0.01 * float(np.median(finite))) if finite.size > 0 else 1e-6
                     ccd = flat_correct(ccd, master_flat, min_value=flat_floor, norm_value=1.0)
-                    _add_history(
-                        ccd.meta, f"Flat-field corrected (min_value={flat_floor:.3g})"
-                    )
+                    _add_history(ccd.meta, f"Flat-field corrected (min_value={flat_floor:.3g})")
                 else:
                     logger.warning("Missing FLAT for %s", fp)
 
-                out_path = output_dir / f"{Path(fp).stem}_cal.fits"
+                # --- Hot pixel interpolation ---
+                if hot_mask is not None and hot_mask.any():
+                    ccd.data = _interpolate_bad_pixels(ccd.data, hot_mask)
+                    _add_history(
+                        ccd.meta,
+                        f"Hot pixel correction: {int(hot_mask.sum())} pixels interpolated",
+                    )
+
+                # --- Cosmic ray rejection ---
+                if fix_cosmic_rays:
+                    try:
+                        gain_val = max(0.1,
+                                         _safe_float(ccd.meta.get("EGAIN"))
+                                         or _safe_float(ccd.meta.get("GAIN"))
+                                         or 1.0)
+                        rn_val   = max(0.1, _safe_float(ccd.meta.get("RDNOISE")) or cr_readnoise)
+                        ccd, n_cr = _apply_cosmicray_rejection(
+                            ccd,
+                            gain=gain_val,
+                            readnoise=rn_val,
+                            sigclip=cr_sigclip,
+                            objlim=cr_objlim,
+                        )
+                        if n_cr > 0:
+                            logger.info("  CR rejection: %d pixel(s) in %s", n_cr, fp.name)
+                            _add_history(
+                                ccd.meta,
+                                f"Cosmic ray rejection: {n_cr} pixel(s) cleaned (L.A.Cosmic)",
+                            )
+                    except Exception:
+                        logger.warning("  Cosmic ray rejection failed for %s", fp.name)
+
+                # Build output path: calibrated/<object>/<filter>/stem_cal.fits
+                obj_name = _get_object_name(fp, light_base)
+                obj_label = obj_name if obj_name else "unknown"
+                out_dir = output_dir / obj_label / filter_label
+                out_dir.mkdir(parents=True, exist_ok=True)
+                out_path = out_dir / f"{fp.stem}_cal.fits"
+
                 ccd.data = ccd.data.astype(np.float32, copy=False)
                 ccd.write(out_path, overwrite=True)
                 created.append(out_path)

@@ -44,3 +44,17 @@ master_files = ./masters
 # Calibration options
 no_bias = no
 dark_scale = no
+
+# Hot pixel correction
+# Pixels in the master dark above  clipped_median + hot_pixel_sigma * clipped_std  are flagged
+# and interpolated from their 3x3 neighbours in every LIGHT frame.
+fix_hot_pixels = yes
+hot_pixel_sigma = 5.0
+
+# Cosmic ray rejection (L.A.Cosmic algorithm)
+# Applied to each calibrated LIGHT frame after bias+dark+flat correction.
+# cr_readnoise is used only when RDNOISE is absent from the FITS header.
+fix_cosmic_rays = yes
+cr_sigclip   = 4.5
+cr_objlim    = 5.0
+cr_readnoise = 8.0
