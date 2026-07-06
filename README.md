@@ -177,6 +177,9 @@ or specify a custom one:
 
 - Automatic filter keyword handling (FILTER/FILT)
 
+## Acknowledgement
+- This work was supported by the Romanian Ministry of Education and Research, through the Executive Agency for Higher Education, Research, Development and Innovation Funding (UEFISCDI), under the National Plan for Research, Development and Innovation 2022–2027 (PN IV), Demonstration Project (PED), Contract No. 12PED/2025, project "IMAGINER – Image Enhancement Algorithms for Photovoltaic Panel Monitoring.
+
 ## References
 
 - Astropy Project: core library and documentation (https://www.astropy.org/)
