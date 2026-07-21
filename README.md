@@ -1,214 +1,246 @@
-# CCD Calibration Pipeline
+# 📘 CCD Calibration Pipeline
 
-Automated pipeline in Python for **calibrating CCD images** using [`astropy`](https://docs.astropy.org/) and [`ccdproc`](https://ccdproc.readthedocs.io/).
-Builds master calibration frames (BIAS, DARK, FLAT) and applies them to science frames (e.g. `LIGHT`) following standard CCD reduction procedures.
+Automated pipeline in Python for **calibrating CCD/CMOS images** using [`astropy`](https://docs.astropy.org/) and [`ccdproc`](https://ccdproc.readthedocs.io/).  
+Builds master calibration frames (BIAS, DARK, FLAT) and applies them to science frames (`LIGHT`), then optionally combines the calibrated frames — following the standard CCD reduction procedures from the [Astropy CCD Data Reduction Guide](https://www.astropy.org/ccd-reduction-and-photometry-guide/).
 
 ---
 
-## Features
+## 🧩 Features
 
-- Automatic grouping of FITS files by header keywords:
+- Automatic grouping of FITS files by:
   - `IMAGETYP`
   - binning (`XBINNING`, `YBINNING`)
   - `GAIN`
-  - `EXPTIME`
-  - rounded `CCD-TEMP` with ±2 °C tolerance-based matching
-  - `FILTER` (for FLAT and LIGHT frames; defaults to `"Clear"` when absent)
-- All metadata read exclusively from FITS headers — no filename parsing
-- Master frame creation:
-  - sigma-clipped median combination (`mad_std` dispersion estimator)
-  - optional bias and dark pre-correction for DARK/FLAT masters
-- Science frame calibration sequence per group:
-  1. Bias subtraction (optional)
-  2. Dark subtraction matched by exposure time and temperature (with optional scaling)
-  3. Flat-field correction with dead-pixel floor protection
-  4. Hot pixel interpolation from master dark (sigma-clipped detection, 3×3 neighbour median)
-  5. Cosmic ray rejection via L.A.Cosmic algorithm (optional; uses `EGAIN` header for noise model)
-- Robust master selection:
-  - ambiguous matches resolved interactively via stdin
-  - FITS `HISTORY` updated at each processing step
-  - configurable logging with `debug` mode
-- Output organised as `calibrated/<object>/<filter>/`
-- Fully file-system based, no external database required
+  - `EXPTIME` (darks / flats / lights)
+  - commanded set-point temperature (`SET-TEMP`, exact), with `CCD-TEMP` used as a cooling-stabilization check
+  - `FILTER` (flats / lights) and EL injection current (combination)
+- Creation of master frames using:
+  - sigma-clipped `average` combination (`median` optional), 5σ/5σ by default
+  - `mad_std` as the dispersion estimator and `np.ma.median` as the center
+  - per-frame quality control (level / noise outliers rejected)
+  - read-noise estimate from frame-pair differences (`RDNOISE`)
+  - memory-limited, chunked I/O for large stacks
+- Science frame calibration (all through `ccdproc`):
+  1. Overscan subtraction / trim (when `BIASSEC` / `TRIMSEC` are present)
+  2. Bias subtraction (only when the master dark is bias-subtracted)
+  3. Dark subtraction (with optional exposure-time scaling)
+  4. Flat-field correction with protection against divide-by-zero / dead pixels
+  5. Optional hot-pixel repair (from the master dark) and cosmic-ray rejection (L.A.Cosmic)
+- Combination of calibrated frames (`mean` / `median` / `sum` / `sclip`)
+- Robust handling:
+  - automatic master selection based on metadata
+  - `no_bias`, `level_align` and `dark_scale` options for tricky CMOS sessions
+  - FITS `HISTORY` updated with each processing step
+- Fully file-system based, no external database required.
 
 ---
 
-## Installation
+## ⚙️ Installation
 
 Requires Python ≥ 3.10.
 
-Dependencies:
-```
-numpy
-astropy
-ccdproc
-```
+Core dependencies:
+- `numpy`
+- `astropy`
+- `ccdproc`
+- `astroscrappy` (only when cosmic-ray rejection, `fix_cosmic_rays`, is enabled)
+
+Install:
 
 ```bash
-pip install numpy astropy ccdproc
+pip install numpy astropy ccdproc astroscrappy
 ```
 
----
-
-## Directory Structure
-
-Expected layout before running:
-
+## 📁 Directory Structure
+Expected layout before running the pipeline (the `Bias` / `Dark` / `Flat` / `Light` subfolders are matched case-insensitively inside `images_path`):
+```bash
+images_path/
+├── Bias/
+├── Dark/
+├── Flat/
+├── Light/                 # may contain per-object / per-panel subfolders
+├── <masters_folder>/      # generated master frames
+├── calibrated/            # generated calibrated science frames
+└── combined/              # generated combined science frames
 ```
-project_root/
-├── raw/
-│   ├── BIAS/
-│   ├── DARK/
-│   ├── FLAT/
-│   └── LIGHT/
-│       └── ObjectName/       # subdirectory name becomes the object label
-├── masters/                  # generated master frames (configured via master_output)
-├── calibrated/               # calibrated science frames (configured via output_dir)
-│   └── ObjectName/
-│       └── FilterName/
-├── config.ini
-├── fits_image_calibration.py
-├── run_calibration_pipeline.py
-└── README.md
+The pipeline scripts live together (e.g. in the repository root):
+```bash
+run_pipeline.py            # config-driven runner
+config.ini                 # configuration
+calib_common.py            # generic helpers (paths, header parsing, formatting)
+grouping.py                # frame grouping
+masters.py                 # master index + selection
+ccd_ops.py                 # ccdproc wrappers, QC and statistics
+master_bias.py             # step 1
+master_dark.py             # step 2
+master_flat.py             # step 3
+light_calibration.py       # step 4
+light_combination.py       # step 5
 ```
-
 Input FITS files must:
-- Contain correct `IMAGETYP` values: `BIAS`, `DARK`, `FLAT`, `LIGHT`
-- Provide consistent `EXPTIME`, `XBINNING` / `YBINNING`, `GAIN`
-- Optionally provide `CCD-TEMP` for temperature-aware grouping and master matching
-- Optionally provide `FILTER` for flat/light grouping (defaults to `"Clear"` if absent)
-- Optionally provide `EGAIN` [e⁻/ADU] for accurate cosmic ray noise modelling
 
----
+Contain correct IMAGETYP values: e.g. BIAS, DARK, FLAT, LIGHT
 
-## Configuration
+Provide consistent EXPTIME, XBINNING / YBINNING, GAIN
 
-The pipeline is controlled via an INI file (default: `config.ini`).
-All paths can be absolute or relative to the config file location.
+Optionally provide SET-TEMP / CCD-TEMP for temperature-aware grouping, and FILTER for flats/lights
+
+## 🧰 Configuration
+The pipeline is controlled via an INI file (default: `config.ini` next to `run_pipeline.py`). It is organized into sections; commented lines equal the built-in defaults, so uncomment only what you want to change.
 
 ```ini
-[GENERAL]
-debug = yes        # enable verbose DEBUG logging
+[paths]
+images_path = /path/to/calibration_files   ; folder with the Bias/Dark/Flat/Light subfolders
+masters_folder = processed/masters          ; relative to images_path, or an absolute path
+
+[steps]
+master_bias  = true                         ; true / false for each step
+master_dark  = true
+master_flat  = true
+calibration  = true
+combination  = true
+
+[general]
+temp_match_tol = 1.0                         ; max |CCD-TEMP - SET-TEMP| for a usable frame [deg C]
+mem_budget_mb  = 1024                         ; approximate RAM ceiling for combination [MB]
+
+[master_settings]
+combine_method    = average                  ; average (recommended) or median
+sigma_clip_low    = 5.0                       ; sigma clipping at combination
+sigma_clip_high   = 5.0
+min_frames_for_qc = 10                        ; below this frame count, QC only warns
+median_sigma      = 5.0                       ; reject if |median - group| > median_sigma*MAD + floor
+median_floor_adu  = 5.0
+std_ratio_max     = 2.0                       ; reject if noise is outside [group/x, group*x]
+max_rn_pairs      = 8                         ; frame pairs used for read-noise estimation
+
+[master_dark]
+no_bias           = true                      ; build darks from raw frames (recommended for CMOS)
+level_align       = true                      ; align each frame's level to the group median
+neg_median_tol_adu = 0.2                       ; anti-damage screen against a mismatched master bias
+
+[master_flat]
+dark_scale        = false                     ; allow scaling a bias-subtracted dark by exposure
+min_frames_for_qc = 5
+saturation_adu    = 65535
+sat_median_frac   = 0.90
+min_median_frac   = 0.05
+
+[calibration]
+dark_scale        = false                     ; allow scaling the dark when calibrating lights
+flat_min          = 0.2                        ; flat pixels below this are clamped (min_value)
+fix_cosmic_rays   = false                     ; L.A.Cosmic rejection per frame (needs astroscrappy)
+cr_sigclip        = 4.5                        ; L.A.Cosmic detection threshold [sigma]
+cr_objlim         = 5.0                        ; L.A.Cosmic CR-vs-source contrast limit
+cr_readnoise      = 8.0                        ; fallback read noise [e-] when RDNOISE is absent
+fix_hot_pixels    = false                     ; interpolate hot pixels flagged from the master dark
+hot_pixel_sigma   = 5.0                        ; hot-pixel threshold [sigma above the dark median]
+
+[combination]
+method            = mean                      ; mean / median / sum / sclip
 ```
 
-```ini
-[MASTERS]
-raw_root = ./raw           # root folder containing BIAS/DARK/FLAT subfolders
-master_output = ./masters  # where master files are written
+`run_pipeline.py` passes the numeric settings to the step scripts through `CALIB_*` environment variables; a script run standalone (without the runner) uses the built-in defaults from the code. An unknown key in a known section stops the pipeline with an error (typo protection).
 
-build_bias = yes
-build_dark = yes
-build_flat = yes
+## ▶️ Usage
 
-dark_no_bias = no          # yes: skip bias subtraction when building master DARK
-dark_scale = no            # yes: scale darks by exposure time
-
-flat_no_bias = no          # yes: skip bias subtraction when building master FLAT
-flat_dark_scale = no       # yes: scale darks when correcting flats
-
-mem_limit_mb = 2048        # memory limit for frame combination (MB)
-```
-
-```ini
-[CALIBRATION]
-run_calibration = yes
-file_type = LIGHT          # IMAGETYP of science frames to calibrate
-input_root = ./raw         # root directory containing <file_type> subfolder
-output_dir = ./calibrated  # root output directory
-
-# directory or comma-separated list of master FITS paths
-master_files = ./masters
-
-no_bias = no               # yes: skip bias subtraction on science frames
-dark_scale = no            # yes: scale master darks by exposure time
-
-# Hot pixel correction
-# Pixels in the master dark above  median + hot_pixel_sigma * clipped_std
-# are flagged and replaced by the median of valid 3×3 neighbours in each LIGHT frame.
-fix_hot_pixels = yes
-hot_pixel_sigma = 5.0
-
-# Cosmic ray rejection (L.A.Cosmic algorithm)
-# Applied after bias+dark+flat+hot-pixel correction.
-# cr_readnoise is used only when RDNOISE is absent from the FITS header.
-# NOTE: not suitable for images of extended bright objects (e.g. illuminated panels);
-#       set fix_cosmic_rays = no in such cases.
-fix_cosmic_rays = yes
-cr_sigclip   = 4.5
-cr_objlim    = 5.0
-cr_readnoise = 8.0
-```
-
----
-
-## Usage
-
+Run the whole pipeline using the default configuration file:
 ```bash
-python run_calibration_pipeline.py                  # uses ./config.ini
-python run_calibration_pipeline.py path/to/my.cfg   # custom config file
+    python run_pipeline.py
+```
+or specify a custom one:
+```bash
+    python run_pipeline.py path/to/config.ini
+```
+Each step can also be run standalone:
+```bash
+    python master_bias.py        <images_path> [masters_folder]
+    python master_dark.py        <images_path> [masters_folder] [no_bias] [level_align]
+    python master_flat.py        <images_path> [masters_folder] [dark_scale]
+    python light_calibration.py  <images_path> [masters_folder] [dark_scale]
+    python light_combination.py  <images_path>/calibrated [method]
 ```
 
----
+## 📊 Output
 
-## Output
+| Type                      | Directory      | Example Filename                                        |
+| ------------------------- | -------------- | ------------------------------------------------------ |
+| Master Bias               | `<masters>/`   | `master_bias_bin2x2_gain120_temp-20C.fits`             |
+| Master Dark               | `<masters>/`   | `master_dark_bin2x2_gain120_exp10s_temp-20C.fits`      |
+| Master Flat               | `<masters>/`   | `master_flat_bin2x2_gain120_exp1s_temp-20C_filtSDSS-y.fits` |
+| Calibrated Science Frames | `calibrated/`  | `Light_001_cal.fits`                                   |
+| Combined Science Frames   | `combined/`    | `combined_mean_bin2x2_gain120_exp10s_temp-20C_5A_SDSS-y.fits` |
 
-| Type | Directory | Example filename |
-|------|-----------|-----------------|
-| Master Bias | `masters/` | `master_bias_b2x2_g120_sNA_CNA.fits` |
-| Master Dark | `masters/` | `master_dark_b2x2_g120_10s_-15.0C.fits` |
-| Master Flat | `masters/` | `master_flat_b2x2_g120_1s_-15.0C_Clear.fits` |
-| Calibrated science | `calibrated/<object>/<filter>/` | `Light_001_cal.fits` |
+## How it works (technical summary)
 
----
+1. Master builders (`master_bias.py`, `master_dark.py`, `master_flat.py`)
 
-## How It Works
+    - Scan the `Bias` / `Dark` / `Flat` subfolders for FITS files.
 
-### `fits_image_calibration.py`
+    - Group frames by `(IMAGETYP, binning, GAIN, EXPTIME, SET-TEMP)`; frames whose `CCD-TEMP` deviates from `SET-TEMP` by more than `temp_match_tol` are dropped (cooler not stabilized).
 
-1. Scans input directories recursively for `.fit` / `.fits` files (case-insensitive).
-2. Groups frames by `(IMAGETYP, binning, GAIN, EXPTIME, rounded CCD-TEMP, FILTER)`.
-   - Temperature rounding step: 0.5 °C; merge tolerance: ±2 °C.
-   - FILTER applied to FLAT and LIGHT only; BIAS/DARK always get `None`.
-3. Builds master BIAS/DARK using `ccdproc.combine` (sigma-clipped median, `mad_std`).
-4. Builds master FLAT using per-frame 1/median scaling before combination.
-5. For science frames, finds the best master for each group:
-   - DARK: must match exposure exactly (rel_tol=1e-6) and temperature (±2 °C).
-   - FLAT: must match filter; exposure and temperature not required.
-   - BIAS: matched by binning and gain only.
-   - Ambiguous matches prompt the user interactively.
-6. Applies calibration: bias → dark → flat → hot pixels → cosmic rays.
-7. Writes output as float32 FITS with updated `HISTORY` keywords.
+    - Run per-frame QC, then build master BIAS/DARK/FLAT with `ccdproc.combine` (sigma clipping, `mad_std`); flats are combined with `scale=1/median` and renormalized to a median of 1.0.
 
-### `run_calibration_pipeline.py`
+    - Encode the grouping parameters in the output filename and update the FITS `HISTORY`.
 
-- Reads configuration from `config.ini`.
-- Optionally builds BIAS, DARK, FLAT masters in order.
-- Calibrates science frames using the produced (or pre-existing) masters.
+2. Science calibration (`light_calibration.py`)
 
----
+    - Groups the `Light` frames, selects the matching masters and calibrates each frame with `ccdproc`: overscan/trim → `subtract_bias` (only when the dark is bias-subtracted) → `subtract_dark` (scaled when allowed) → `flat_correct`.
 
-## Assumptions and Limitations
+    - Optionally cleans each calibrated frame: hot-pixel interpolation (from the master dark) and L.A.Cosmic cosmic-ray rejection, both off by default and enabled via `[calibration]`.
 
-- Primary image data must be in the primary HDU (extension 0).
-- Standard FITS keywords required: `IMAGETYP`, `EXPTIME`, `XBINNING`, `YBINNING`, `GAIN`.
-- For accurate cosmic ray noise modelling, `EGAIN` [e⁻/ADU] should be present in the header (falls back to `GAIN` if absent).
+    - Writes `*_cal.fits` into `calibrated/`, preserving the Light subfolder structure.
+
+3. Combination (`light_combination.py`)
+
+    - Groups the calibrated frames (subfolder, binning, gain, exposure, temperature, `FILTER`, EL current) and combines each multi-frame group with the chosen method into `combined/`.
+
+    - `FILTER` and EL current are read from the header, or parsed from the filename when absent.
+
+4. Runner (`run_pipeline.py`)
+
+    - Reads `config.ini`, validates it, and runs the enabled steps in order, stopping at the first failing step so later steps never run with missing inputs.
+
+## Assumptions and limitations
+
+- Assumes primary image data in the primary HDU.
+
+- Assumes standard FITS keywords:
+
+    - IMAGETYP, EXPTIME, XBINNING, YBINNING, GAIN, SET-TEMP / CCD-TEMP (and FILTER for flats/lights).
+
 - Designed for single-CCD workflows; multi-extension instruments need adaptation.
-- L.A.Cosmic is designed for astronomical images with sparse point sources and dark backgrounds. It is not suitable for images of bright extended objects (solar panels, lab targets, etc.) — disable with `fix_cosmic_rays = no` in those cases.
 
----
+- Relies on correct header metadata for reliable master selection.
 
-## Scientific Notes
+## 🔬 Scientific Notes
 
-- Combination uses sigma-clipping (3σ, 5 iterations) with `mad_std` dispersion.
-- Hot pixel detection uses `sigma_clipped_stats` (sigma=3.0) so the threshold is robust even when the pixel distribution is highly quantized (MAD = 0).
-- Dark master matching requires exact exposure time (rel_tol=1e-6) and temperature within ±2 °C.
-- `dark_scale = yes` linearly scales the dark by the exposure ratio — intended only for cases where an exactly-matched dark is unavailable.
-- FITS metadata and processing history preserved in all output headers.
+- Master combination uses sigma clipping (5σ by default, configurable) with `mad_std` dispersion around the median; `sclip` in the combination step uses 3σ.
 
----
+- Temperature matching is exact on `SET-TEMP` (the commanded set point is discrete, so no tolerance chaining is needed); `CCD-TEMP` is only a stabilization check with tolerance `temp_match_tol` (default 1 °C). Frames without `SET-TEMP` fall back to the rounded `CCD-TEMP`.
+
+- Exposure matching uses a relative tolerance of 1e-6.
+
+- A dark is scaled by the exposure ratio only when it is bias-subtracted; a median-level screen blocks a master bias that would drive the darks negative (CMOS with an unstable bias level).
+
+- Optional per-frame cleaning (both off by default): `fix_hot_pixels` flags hot pixels from the master dark (`clipped_median + hot_pixel_sigma·clipped_std`) and replaces them with the 3×3 neighbour median; `fix_cosmic_rays` runs L.A.Cosmic. These are cosmetic per-frame steps — for pure statistical outlier rejection across a stack, prefer the `sclip` combination method.
+
+- FITS metadata and processing history are preserved in the output headers.
+
+## 🧠 Future Improvements
+
+- Optional bad-pixel map to mask dead / over-corrected pixels
+
+- Multi-extension (multi-CCD) support
+
+## Acknowledgement
+- This work was supported by the Romanian Ministry of Education and Research, through the Executive Agency for Higher Education, Research, Development and Innovation Funding (UEFISCDI), under the National Plan for Research, Development and Innovation 2022–2027 (PN IV), Demonstration Project (PED), Contract No. 12PED/2025, project "IMAGINER – Image Enhancement Algorithms for Photovoltaic Panel Monitoring".
 
 ## References
 
-- Astropy Project: [https://www.astropy.org/](https://www.astropy.org/)
-- ccdproc documentation: [https://ccdproc.readthedocs.io/](https://ccdproc.readthedocs.io/)
-- van Dokkum (2001) — L.A.Cosmic algorithm: [https://www.astro.yale.edu/dokkum/lacosmic/](https://www.astro.yale.edu/dokkum/lacosmic/)
+- Astropy Project: core library and documentation (https://www.astropy.org/)
+
+- Astropy CCD Data Reduction Guide (https://www.astropy.org/ccd-reduction-and-photometry-guide/)
+
+- ccdproc: CCD data reduction tools (https://ccdproc.readthedocs.io/)
+                                    (https://github.com/astropy/ccdproc)
