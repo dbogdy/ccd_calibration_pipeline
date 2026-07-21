@@ -19,11 +19,19 @@ dark_scale = no
 # Building master FLAT
 build_flat = yes
 flat_no_bias = no
+# yes: if no dark matches the flat exposure exactly, the closest-exposure
+# dark is used and scaled by the exposure ratio. Requires bias-subtracted
+# master darks (dark_no_bias = no), otherwise the bias gets scaled too.
 flat_dark_scale = no
 
 # Memory limit for frame combination (MB). Increase for faster processing
 # if you have enough RAM, decrease if you get out-of-memory errors.
 mem_limit_mb = 2048
+
+# Minimum median signal [ADU] a flat frame must retain after bias/dark
+# subtraction. Frames below this are flagged as underexposed (warning in
+# log + FITS HISTORY). Adjust to your camera's full-well/bit depth.
+flat_min_signal_adu = 1000
 
 [CALIBRATION]
 # Run calibration of science frames (yes/no)
@@ -43,6 +51,9 @@ master_files = ./masters
 
 # Calibration options
 no_bias = no
+# yes: if no dark matches the light exposure exactly, the closest-exposure
+# dark is used and scaled by the exposure ratio. Requires bias-subtracted
+# master darks, otherwise the bias gets scaled too.
 dark_scale = no
 
 # Hot pixel correction
@@ -54,7 +65,27 @@ hot_pixel_sigma = 5.0
 # Cosmic ray rejection (L.A.Cosmic algorithm)
 # Applied to each calibrated LIGHT frame after bias+dark+flat correction.
 # cr_readnoise is used only when RDNOISE is absent from the FITS header.
+# NOTE: designed for astronomical images (sparse point sources on a dark
+# background). For bright extended objects - e.g. electroluminescence
+# images of solar panels - set fix_cosmic_rays = no.
 fix_cosmic_rays = yes
 cr_sigclip   = 4.5
 cr_objlim    = 5.0
 cr_readnoise = 8.0
+
+[COMBINATION]
+# Combine calibrated LIGHT frames that share the same settings
+# (binning, gain, exposure, temperature, filter), per object (yes/no).
+# NOTE: frames are combined AS-IS, with no star alignment/registration.
+# Suitable for a fixed camera (e.g. electroluminescence of solar panels)
+# or perfectly tracked sequences; dithered/drifting sky images must be
+# aligned with an external tool before combination.
+run_combination = no
+
+# Combination method: median | average | sum
+# For 'sum' the EXPTIME of the output is updated to the total exposure.
+method = median
+
+# Combined files are written here, separate from the calibrated frames:
+# <output_dir>/<object>/<filter>/<object>_..._<method>_<N>frames.fits
+output_dir = ./combined

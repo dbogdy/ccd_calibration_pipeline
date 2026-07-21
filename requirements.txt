@@ -1,0 +1,5 @@
+# CCD Calibration Pipeline - Python >= 3.10
+# Versions verified working: numpy 2.2.6, astropy 7.1.1, ccdproc 2.5.1
+numpy>=1.24
+astropy>=5.3
+ccdproc>=2.4
