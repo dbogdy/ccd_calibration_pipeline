@@ -1,46 +1,82 @@
-[GENERAL]
-debug = yes
+; Config for run_pipeline.py (v3, ccdproc)
+; Steps run in order: bias -> dark -> flat -> calibration -> combination.
+; Commented lines (;) = the built-in defaults from the scripts; uncomment
+; only what you want to change. Scripts run standalone always use the
+; built-in defaults.
 
-[MASTERS]
-# Root directory where you have the BIAS/DARK/FLAT sub folders with raw
-raw_root = ./raw
+[paths]
+; Folder holding the Bias / Dark / Flat / Light subfolders
+images_path = /mnt/d/calibration_test_new/calibration_files
+; Masters folder: name relative to images_path, or an absolute path
+masters_folder = processed/masters2
 
-# Where are the masters saved
-master_output = ./masters
+[steps]
+; true / false for each step
+master_bias = false
+master_dark = true
+master_flat = false
+calibration = false
+combination = false
 
-# Building master BIAS
-build_bias = yes
+[general]
+; Grouping and master matching are done on SET-TEMP (exact); a frame is
+; dropped when |CCD-TEMP - SET-TEMP| exceeds this threshold [deg C]
+temp_match_tol = 1.0
+; Approximate RAM ceiling for combination [MB]
+mem_budget_mb = 1024
 
-# Building master DARK
-build_dark = yes
-dark_no_bias = no
-dark_scale = no
+[master_settings]
+; Common settings for all masters (bias / dark / flat).
+; Master combine method: average (recommended, astropy guide) or median
+combine_method = average
+; Sigma clipping at combination (astropy guide: 5/5)
+sigma_clip_low = 5.0
+sigma_clip_high = 5.0
+; QC bias/dark: below this frame count, only warn - never reject
+min_frames_for_qc = 10
+; QC: reject if |median - group| > median_sigma * MAD + median_floor_adu
+median_sigma = 5.0
+median_floor_adu = 5.0
+; QC: reject if frame noise is outside [group/x, group*x]
+std_ratio_max = 2.0
+; Frame pairs used to estimate read noise / pair noise
+max_rn_pairs = 8
 
-# Building master FLAT
-build_flat = yes
-flat_no_bias = no
-flat_dark_scale = no
+[master_bias]
+; (no specific settings - uses [master_settings])
 
-# Memory limit for frame combination (MB). Increase for faster processing
-# if you have enough RAM, decrease if you get out-of-memory errors.
-mem_limit_mb = 2048
+[master_dark]
+; Build darks from raw frames, without bias subtraction (recommended CMOS)
+no_bias = true
+; Align each frame's global level to the group median instead of rejecting
+level_align = true
+; Anti-damage: bias is NOT applied if the predicted median of any frame
+; would drop below -this threshold [ADU]
+neg_median_tol_adu = 0.2
 
-[CALIBRATION]
-# Run calibration of science frames (yes/no)
-run_calibration = yes
+[master_flat]
+; Allow scaling a dark of a different exposure (bias-subtracted only)
+dark_scale = false
+; QC flats: minimum frame count, ADC saturation, median limits
+min_frames_for_qc = 5
+saturation_adu = 65535
+sat_median_frac = 0.90
+min_median_frac = 0.05
 
-# The type of scientific frames (IMAGETYP in the header), e.g. LIGHT, OBJECT, etc.
-file_type = LIGHT
+[calibration]
+; Allow scaling the dark when calibrating lights
+dark_scale = false
+; Pixels with a flat below this threshold are clamped to it (min_value)
+flat_min = 0.2
+; Cosmic-ray rejection (L.A.Cosmic) on each calibrated frame; needs astroscrappy
+fix_cosmic_rays = false
+cr_sigclip = 4.5
+cr_objlim = 5.0
+cr_readnoise = 8.0
+; Hot-pixel repair: interpolate pixels flagged from the master dark
+fix_hot_pixels = true
+hot_pixel_sigma = 5.0
 
-# Root directory with subfolder <file_type> (ex: ./raw/LIGHT)
-input_root = ./raw
-
-# Where to write calibrated FITS
-output_dir = ./calibrated
-
-# Where are the masters read from (folder or files)
-master_files = ./masters
-
-# Calibration options
-no_bias = no
-dark_scale = no
+[combination]
+; Combination method: mean / median / sum / sclip
+method = sclip
