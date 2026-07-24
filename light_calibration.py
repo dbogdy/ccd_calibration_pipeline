@@ -45,8 +45,8 @@ import numpy as np
 import astropy.units as u
 import ccdproc as ccdp
 
-from calib_common import (as_float, collect_fits_files, env_float, fexp,
-                          find_subfolder)
+from calib_common import (as_float, collect_fits_files, env_float, env_path,
+                          fexp, find_subfolder)
 from grouping import group_frames
 from masters import find_master, index_masters
 from ccd_ops import (CR_OBJLIM, CR_READNOISE, CR_SIGCLIP, HOT_PIXEL_SIGMA,
@@ -117,7 +117,9 @@ def main():
     print(f"Found {len(dark_index)} DARK, {len(bias_index)} BIAS, "
           f"{len(flat_index)} FLAT master(s) in {masters_dir}")
 
-    out_root = root / "calibrated"
+    # Output folder: CALIB_CALIBRATED_DIR (set by run_pipeline.py) or, when
+    # run standalone, <path>/calibrated.
+    out_root = env_path("CALIB_CALIBRATED_DIR", root / "calibrated")
 
     calibrated = 0
     sort_key = lambda g: (g["binx"] or 0, g["biny"] or 0, g["gain"] or 0,

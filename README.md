@@ -59,9 +59,10 @@ images_path/
 ├── Dark/
 ├── Flat/
 ├── Light/                 # may contain per-object / per-panel subfolders
-├── <masters_folder>/      # generated master frames
-├── calibrated/            # generated calibrated science frames
-└── combined/              # generated combined science frames
+└── <output_folder>/       # all products (default "processed"; empty = images_path itself)
+    ├── masters/           # generated master frames
+    ├── calibrated/        # generated calibrated science frames
+    └── combined/          # generated combined science frames
 ```
 The pipeline scripts live together (e.g. in the repository root):
 ```bash
@@ -90,8 +91,11 @@ The pipeline is controlled via an INI file (default: `config.ini` next to `run_p
 
 ```ini
 [paths]
-images_path = /path/to/calibration_files   ; folder with the Bias/Dark/Flat/Light subfolders
-masters_folder = processed/masters          ; relative to images_path, or an absolute path
+images_path       = /path/to/calibration_files ; folder with the Bias/Dark/Flat/Light subfolders
+output_folder     = processed                  ; all products go here (relative to images_path, or absolute; empty = images_path)
+;masters_folder    = masters                    ; subfolder names inside output_folder (defaults shown;
+;calibrated_folder = calibrated                 ;  each may also be an absolute path, which then wins)
+;combined_folder   = combined
 
 [steps]
 master_bias  = true                         ; true / false for each step
@@ -140,7 +144,7 @@ hot_pixel_sigma   = 5.0                        ; hot-pixel threshold [sigma abov
 method            = mean                      ; mean / median / sum / sclip
 ```
 
-`run_pipeline.py` passes the numeric settings to the step scripts through `CALIB_*` environment variables; a script run standalone (without the runner) uses the built-in defaults from the code. An unknown key in a known section stops the pipeline with an error (typo protection).
+`run_pipeline.py` passes the numeric settings to the step scripts through `CALIB_*` environment variables; a script run standalone (without the runner) uses the built-in defaults from the code. The calibrated / combined output locations are passed the same way (`CALIB_CALIBRATED_DIR` / `CALIB_COMBINED_DIR`), so a single `output_folder` keeps masters, calibrated and combined frames together under one folder. An unknown key in a known section stops the pipeline with an error (typo protection).
 
 ## ▶️ Usage
 
@@ -165,11 +169,11 @@ Each step can also be run standalone:
 
 | Type                      | Directory      | Example Filename                                        |
 | ------------------------- | -------------- | ------------------------------------------------------ |
-| Master Bias               | `<masters>/`   | `master_bias_bin2x2_gain120_temp-20C.fits`             |
-| Master Dark               | `<masters>/`   | `master_dark_bin2x2_gain120_exp10s_temp-20C.fits`      |
-| Master Flat               | `<masters>/`   | `master_flat_bin2x2_gain120_exp1s_temp-20C_filtSDSS-y.fits` |
-| Calibrated Science Frames | `calibrated/`  | `Light_001_cal.fits`                                   |
-| Combined Science Frames   | `combined/`    | `combined_mean_bin2x2_gain120_exp10s_temp-20C_5A_SDSS-y.fits` |
+| Master Bias               | `<output_folder>/masters/`    | `master_bias_bin2x2_gain120_temp-20C.fits`             |
+| Master Dark               | `<output_folder>/masters/`    | `master_dark_bin2x2_gain120_exp10s_temp-20C.fits`      |
+| Master Flat               | `<output_folder>/masters/`    | `master_flat_bin2x2_gain120_exp1s_temp-20C_filtSDSS-y.fits` |
+| Calibrated Science Frames | `<output_folder>/calibrated/` | `Light_001_cal.fits`                                   |
+| Combined Science Frames   | `<output_folder>/combined/`   | `combined_mean_bin2x2_gain120_exp10s_temp-20C_5A_SDSS-y.fits` |
 
 ## How it works (technical summary)
 

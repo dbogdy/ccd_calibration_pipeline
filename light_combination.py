@@ -39,7 +39,7 @@ from pathlib import Path
 
 from astropy.io import fits
 
-from calib_common import collect_fits_files, fexp, tag
+from calib_common import collect_fits_files, env_path, fexp, tag
 from grouping import group_frames
 from ccd_ops import combine_frames
 
@@ -152,7 +152,9 @@ def main():
     for g in single:
         print(f"  single frame, not combined: {g['files'][0].name}")
 
-    out_root = cal_dir.parent / "combined"
+    # Output folder: CALIB_COMBINED_DIR (set by run_pipeline.py) or, when run
+    # standalone, a "combined" folder next to the calibrated one.
+    out_root = env_path("CALIB_COMBINED_DIR", cal_dir.parent / "combined")
 
     combined = 0
     sort_key = lambda g: (str(g["subdir"]), g["filter"] or "",

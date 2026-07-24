@@ -6,17 +6,24 @@
 
 [paths]
 ; Folder holding the Bias / Dark / Flat / Light subfolders
-images_path = /mnt/d/calibration_test_new/calibration_files
-; Masters folder: name relative to images_path, or an absolute path
-masters_folder = processed/masters2
+images_path = /path/to/calibration_files
+; Output folder for all products (relative to images_path, or absolute).
+; The masters, calibrated and combined frames go into subfolders of it.
+; Leave empty to write them directly under images_path.
+output_folder = processed
+; Subfolder names inside output_folder (defaults shown; each may also be an
+; absolute path, which then wins over output_folder).
+;masters_folder = masters
+;calibrated_folder = calibrated
+;combined_folder = combined
 
 [steps]
 ; true / false for each step
-master_bias = false
+master_bias = true
 master_dark = true
-master_flat = false
-calibration = false
-combination = false
+master_flat = true
+calibration = true
+combination = true
 
 [general]
 ; Grouping and master matching are done on SET-TEMP (exact); a frame is

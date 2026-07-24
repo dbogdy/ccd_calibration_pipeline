@@ -43,6 +43,19 @@ def env_int(name, default):
         return default
 
 
+def env_path(name, default=None):
+    """
+    Read a directory-path override from the environment (see env_float).
+    run_pipeline.py sets CALIB_CALIBRATED_DIR / CALIB_COMBINED_DIR so that
+    masters, calibrated and combined frames all land under one output folder;
+    scripts run standalone (no runner) keep their built-in default location.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return Path(raw.strip())
+
+
 def env_choice(name, default, choices):
     raw = os.environ.get(name)
     if raw is None:

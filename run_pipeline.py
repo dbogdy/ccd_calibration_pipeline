@@ -9,11 +9,18 @@ Usage:
 Reads the configuration ("config.ini" next to this script by default),
 then runs the enabled steps in order by invoking the existing scripts:
 
-    1. master_bias.py        <images_path> <masters_folder>
-    2. master_dark.py        <images_path> <masters_folder> [no_bias] [level_align]
-    3. master_flat.py        <images_path> <masters_folder> [dark_scale]
-    4. light_calibration.py  <images_path> <masters_folder> [dark_scale]
-    5. light_combination.py  <images_path>/calibrated [method]
+    1. master_bias.py        <images_path> <masters_dir>
+    2. master_dark.py        <images_path> <masters_dir> [no_bias] [level_align]
+    3. master_flat.py        <images_path> <masters_dir> [dark_scale]
+    4. light_calibration.py  <images_path> <masters_dir> [dark_scale]
+    5. light_combination.py  <calibrated_dir> [method]
+
+Output layout: everything is written under one output folder. Set
+[paths] output_folder (relative to images_path, or absolute) and the
+masters, calibrated and combined frames land in subfolders of it
+(<output_folder>/masters, /calibrated, /combined by default). The
+calibrated/combined locations are passed to the scripts through the
+CALIB_CALIBRATED_DIR / CALIB_COMBINED_DIR environment variables.
 
 Each step inherits this process's console, so all output is shown live.
 The pipeline stops at the first step that exits with an error, so a later
@@ -134,19 +141,46 @@ def load_config(path: Path):
 
 
 def build_steps(config):
-    """Validate the config and return the list of (name, command) to run."""
+    """
+    Validate the config and return (steps, path_env):
+      - steps:    list of (name, command) to run;
+      - path_env: CALIB_*_DIR overrides that tell the calibration/combination
+                  scripts where to write.
+
+    Layout: everything goes under output_base = <images_path>/<output_folder>
+    ("" -> images_path itself). Inside it: <masters_folder>,
+    <calibrated_folder>, <combined_folder> (defaults masters/calibrated/
+    combined). Any of the four names may be an absolute path, in which case
+    it replaces the base (standard pathlib join behaviour).
+    """
     try:
         images_path = Path(config.get("paths", "images_path").strip())
-        masters_folder = config.get("paths", "masters_folder",
-                                    fallback="masters").strip() or "masters"
     except (configparser.NoSectionError, configparser.NoOptionError) as exc:
         print(f"ERROR: incomplete [paths] section in config: {exc}")
         sys.exit(1)
+
+    output_folder = config.get("paths", "output_folder", fallback="").strip()
+    masters_folder = config.get("paths", "masters_folder",
+                                fallback="masters").strip() or "masters"
+    calibrated_folder = config.get("paths", "calibrated_folder",
+                                   fallback="calibrated").strip() or "calibrated"
+    combined_folder = config.get("paths", "combined_folder",
+                                 fallback="combined").strip() or "combined"
 
     if not images_path.is_dir():
         print(f"ERROR: images_path does not exist or is not a directory: "
               f"{images_path}")
         sys.exit(1)
+
+    output_base = images_path / output_folder if output_folder else images_path
+    masters_dir = output_base / masters_folder
+    calibrated_dir = output_base / calibrated_folder
+    combined_dir = output_base / combined_folder
+
+    path_env = {
+        "CALIB_CALIBRATED_DIR": str(calibrated_dir),
+        "CALIB_COMBINED_DIR": str(combined_dir),
+    }
 
     def enabled(step):
         return config.getboolean("steps", step, fallback=False)
@@ -159,12 +193,12 @@ def build_steps(config):
     if enabled("master_bias"):
         steps.append(("master bias", [
             str(SCRIPT_DIR / "master_bias.py"),
-            str(images_path), masters_folder,
+            str(images_path), str(masters_dir),
         ]))
 
     if enabled("master_dark"):
         cmd = [str(SCRIPT_DIR / "master_dark.py"),
-               str(images_path), masters_folder]
+               str(images_path), str(masters_dir)]
         if option("master_dark", "no_bias"):
             cmd.append("no_bias")
         if option("master_dark", "level_align"):
@@ -173,14 +207,14 @@ def build_steps(config):
 
     if enabled("master_flat"):
         cmd = [str(SCRIPT_DIR / "master_flat.py"),
-               str(images_path), masters_folder]
+               str(images_path), str(masters_dir)]
         if option("master_flat", "dark_scale"):
             cmd.append("dark_scale")
         steps.append(("master flat", cmd))
 
     if enabled("calibration"):
         cmd = [str(SCRIPT_DIR / "light_calibration.py"),
-               str(images_path), masters_folder]
+               str(images_path), str(masters_dir)]
         if option("calibration", "dark_scale"):
             cmd.append("dark_scale")
         if option("calibration", "fix_hot_pixels"):
@@ -196,22 +230,21 @@ def build_steps(config):
             print(f"ERROR: unknown combination method '{method}' in config "
                   f"(available: {', '.join(COMBINATION_METHODS)})")
             sys.exit(1)
-        # light_calibration.py writes into <images_path>/calibrated; when the
+        # light_calibration.py writes into calibrated_dir; when the
         # calibration step runs in this same pipeline the folder will appear,
         # otherwise it must already exist.
-        if not enabled("calibration") \
-                and not (images_path / "calibrated").is_dir():
+        if not enabled("calibration") and not calibrated_dir.is_dir():
             print(f"ERROR: the combination step is enabled but "
-                  f"{images_path / 'calibrated'} does not exist and the "
+                  f"{calibrated_dir} does not exist and the "
                   f"calibration step is disabled. Enable the calibration "
                   f"step or run it first.")
             sys.exit(1)
         steps.append(("light combination", [
             str(SCRIPT_DIR / "light_combination.py"),
-            str(images_path / "calibrated"), method,
+            str(calibrated_dir), method,
         ]))
 
-    return steps
+    return steps, path_env
 
 
 def main():
@@ -227,8 +260,9 @@ def main():
         sys.exit(0)
     print(f"Enabled steps: {', '.join(enabled_names)}")
 
-    steps = build_steps(config)
+    steps, path_env = build_steps(config)
     env, applied = build_env(config)
+    env.update(path_env)
     if applied:
         print(f"Settings overrides: {', '.join(applied)}")
 
