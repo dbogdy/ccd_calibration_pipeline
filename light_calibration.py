@@ -307,14 +307,11 @@ def main():
             ccd.header["BIASSUB"] = (bias_entry is not None,
                                      "Master bias subtracted")
             if bias_entry is not None:
-                ccd.header["BIASFILE"] = (bias_entry["path"].name,
-                                          "Master bias used")
-            ccd.header["DARKFILE"] = (dark_entry["path"].name,
-                                      "Master dark used")
+                ccd.header["BIASFILE"] = bias_entry["path"].name
+            ccd.header["DARKFILE"] = dark_entry["path"].name
             ccd.header["DARKSCAL"] = (dark_scaled,
                                       "Dark scaled by exposure ratio")
-            ccd.header["FLATFILE"] = (flat_entry["path"].name,
-                                      "Master flat used")
+            ccd.header["FLATFILE"] = flat_entry["path"].name
             ccd.header.add_history(
                 f"Calibrated with ccdproc: "
                 f"{'subtract_bias -> ' if bias_entry else ''}"
