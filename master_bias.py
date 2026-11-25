@@ -32,10 +32,11 @@ from astropy.io import fits
 
 from calib_common import collect_fits_files, find_subfolder, tag
 from grouping import group_frames
-from ccd_ops import (MASTER_COMBINE_METHOD, MIN_FRAMES_FOR_QC,
+from ccd_ops import (MASTER_COMBINE_METHOD, MEM_BUDGET_MB, MIN_FRAMES_FOR_QC,
                      ReducedTempDir, apply_overscan_trim, combine_frames,
-                     estimate_pair_noise, filter_majority_shape,
-                     print_frame_table, quality_control, read_ccd,
+                     enough_frames, estimate_pair_noise,
+                     filter_majority_shape, map_frames, print_group_stats,
+                     print_qc_summary, quality_control, read_ccd,
                      scan_frames, warn_if_nonfinite)
 
 
@@ -82,37 +83,55 @@ def main():
         print(f"\nGroup bin={binx}x{biny} gain={gain} temp={temp}C: "
               f"{len(group['files'])} frames")
 
+        # Cheap check first: a group too small to combine is not worth reading.
+        if not enough_frames(len(group["files"]), group["files"]):
+            continue
+
         frames = scan_frames(group["files"])
         if not frames:
             print("  No readable frames in this group, skipping.")
             continue
         frames, shape = filter_majority_shape(frames)
-        print_frame_table(frames)
+        print_group_stats(frames)
 
         if len(frames) >= MIN_FRAMES_FOR_QC:
-            frames, rejected = quality_control(frames)
-            for fr, reason in rejected:
-                print(f"  REJECTED {fr['file'].name}: {reason}")
-        elif len(frames) > 1:
-            print(f"  QC: only {len(frames)} frames (<{MIN_FRAMES_FOR_QC}), "
-                  "no rejection applied")
+            frames, rejected, qc_info = quality_control(frames)
+            print_qc_summary(len(frames), rejected, qc_info)
+        else:
+            print(f"  {'QC':<13}: skipped, only {len(frames)} frames "
+                  f"(<{MIN_FRAMES_FOR_QC}) - no rejection applied")
+
+        # ... and again once shape filtering and QC have taken their cut.
+        if not enough_frames(len(frames), [fr["file"] for fr in frames],
+                             stage="left after QC"):
+            continue
 
         use_files = [fr["file"] for fr in frames]
         first_header = fits.getheader(use_files[0], ext=0)
 
-        # Overscan/trim only when the camera actually provides the sections.
-        needs_prep = bool(first_header.get("BIASSEC")
-                          or first_header.get("TRIMSEC"))
+        # Overscan/trim only when the camera actually provides the sections;
+        # recorded separately because staging now happens either way.
+        overscan_applied = bool(first_header.get("BIASSEC")
+                                or first_header.get("TRIMSEC"))
 
         with ReducedTempDir(masters_dir, "bias") as tmp:
-            if needs_prep:
-                print("  Applying overscan/trim (ccdproc) to each frame ...")
-                prepped = []
-                for f in use_files:
-                    ccd = read_ccd(f)
-                    ccd, _ = apply_overscan_trim(ccd)
-                    prepped.append(tmp.write(ccd, f.name))
-                use_files = prepped
+            # Always stage the frames as float32, exactly like the dark and
+            # flat builders do. Beyond keeping one load/save path for all
+            # master types, this is what makes the combination affordable:
+            # ccdproc.combine re-reads every file once per memory chunk, and
+            # on an integer frame each of those reads materialises the whole
+            # array before a single row block is used. A float32 frame is
+            # read as a lazy view, so a chunk only touches the rows it needs
+            # - measured at ~12 ms per file per chunk against ~128 ms.
+            what = "overscan/trim + stage" if overscan_applied else "stage"
+            print(f"  {'Reducing':<13}: {what} {len(use_files)} frames "
+                  f"as float32 (ccdproc) ...")
+
+            def prep(f):
+                ccd, _ = apply_overscan_trim(read_ccd(f))
+                return tmp.write(ccd, f.name)
+
+            use_files = map_frames(prep, use_files)
 
             # Read noise from the frames actually being combined.
             rn_adu = estimate_pair_noise(use_files)
@@ -122,13 +141,14 @@ def main():
                     rn_e = rn_adu * float(first_header.get("EGAIN"))
                 except (TypeError, ValueError):
                     pass
-                msg = f"  Read noise: {rn_adu:.3f} ADU"
+                msg = f"  {'Read noise':<13}: {rn_adu:.3f} ADU"
                 if rn_e is not None:
                     msg += f" = {rn_e:.3f} e- (via EGAIN)"
                 print(msg)
 
-            print(f"  Combining {len(use_files)} frames (ccdproc.combine, "
-                  f"{MASTER_COMBINE_METHOD} + sigma clip) ...")
+            print(f"  {'Combining':<13}: {len(use_files)} frames, "
+                  f"{MASTER_COMBINE_METHOD} + sigma clip, "
+                  f"mem {MEM_BUDGET_MB} MB ...")
             master = combine_frames(use_files)
 
         master.header["IMAGETYP"] = "BIAS"
@@ -145,7 +165,7 @@ def main():
             f"Master BIAS: ccdproc.combine {MASTER_COMBINE_METHOD} + sigma "
             f"clip of {len(use_files)} frames, bin={binx}x{biny} gain={gain} "
             f"temp={temp}C")
-        if needs_prep:
+        if overscan_applied:
             master.header.add_history(
                 "Per-frame overscan/trim applied (ccdproc)")
         warn_if_nonfinite(master)

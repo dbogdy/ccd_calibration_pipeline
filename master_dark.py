@@ -4,18 +4,13 @@
 Master DARK builder (v3, ccdproc-based).
 
 Usage:
-    python master_dark.py <path> [masters_folder] [no_bias] [level_align]
+    python master_dark.py <path> [masters_folder] [no_bias]
 
 With "no_bias", master bias lookup and subtraction are skipped entirely:
 master darks are built from the raw dark frames (BIASSUB=False in the
 header). Recommended for CMOS cameras with unstable bias levels - the
 master dark then carries the bias inside it and calibrating a light with
 a matching-exposure dark removes both.
-
-With "level_align", frames whose global level differs from the group (CMOS
-offset jumps between ADC steps) are NOT rejected by QC; instead each frame
-is shifted by a constant so its median matches the group median before
-combining.
 
 Looks for a "Dark" folder (case-insensitive) inside <path>, groups the
 DARK frames by binning, gain, exposure and CCD temperature, and writes one
@@ -26,9 +21,11 @@ Processing per group (per the Astropy CCD Data Reduction Guide):
   2. Bias subtraction - ccdproc.subtract_bias with the matching master
      BIAS (same binning/gain and set-point temperature), guarded
      by a median-level screen: dark current is never negative, so when the
-     predicted post-subtraction median of any frame is clearly negative
-     the bias does not belong to this session and is NOT applied
-     (recorded on screen and in the header).
+     group's predicted post-subtraction median is clearly negative (or most
+     of the frames would be), the bias does not belong to this session and
+     is NOT applied (recorded on screen and in the header). Individual
+     frames dipping slightly below zero only produce a note - they are
+     ordinary scatter around a level that is correct for the group.
   3. Combination      - ccdproc.combine: average + sigma clipping around
      the median (mad_std), memory-limited.
 """
@@ -43,36 +40,32 @@ from calib_common import (collect_fits_files, env_float, fexp,
                           find_subfolder, tag)
 from grouping import group_frames
 from masters import find_master, index_masters
-from ccd_ops import (MASTER_COMBINE_METHOD, MIN_FRAMES_FOR_QC,
+from ccd_ops import (MASTER_COMBINE_METHOD, MEM_BUDGET_MB, MIN_FRAMES_FOR_QC,
                      ReducedTempDir, apply_overscan_trim, combine_frames,
-                     estimate_pair_noise, filter_majority_shape,
-                     print_frame_table, quality_control, read_ccd,
+                     enough_frames, estimate_pair_noise,
+                     filter_majority_shape, map_frames, print_group_stats,
+                     print_qc_summary, quality_control, read_ccd,
                      scan_frames, warn_if_nonfinite)
 
 import ccdproc as ccdp
 
-# Dark current is never negative: when the predicted median of any frame
-# after bias subtraction is below -this, the master bias does not match
-# this dark session (CMOS bias levels drift/jump) and is not applied.
+# Dark current is never negative: when the group's predicted median after
+# bias subtraction is below -this, the master bias does not match this dark
+# session (CMOS bias levels drift/jump) and is not applied.
 NEG_MEDIAN_TOL_ADU = env_float("CALIB_NEG_MEDIAN_TOL_ADU", 1.0)
 
 
 def main():
     args = sys.argv[1:]
     skip_bias = False
-    level_align = False
     for flag in ("no_bias", "--no_bias", "--no-bias"):
         if flag in args:
             args.remove(flag)
             skip_bias = True
-    for flag in ("level_align", "--level_align", "--level-align"):
-        if flag in args:
-            args.remove(flag)
-            level_align = True
 
     if len(args) not in (1, 2):
         print(f"Usage: python {Path(sys.argv[0]).name} "
-              "<path> [masters_folder] [no_bias] [level_align]")
+              "<path> [masters_folder] [no_bias]")
         sys.exit(1)
 
     root = Path(args[0])
@@ -126,47 +119,42 @@ def main():
         print(f"\nGroup bin={binx}x{biny} gain={gain} exp={fexp(exp)}s "
               f"temp={temp}C: {len(group['files'])} frames")
 
+        # Cheap check first: a group too small to combine is not worth reading.
+        if not enough_frames(len(group["files"]), group["files"]):
+            continue
+
         frames = scan_frames(group["files"])
         if not frames:
             print("  No readable frames in this group, skipping.")
             continue
         frames, shape = filter_majority_shape(frames)
-        print_frame_table(frames)
-
-        # --- Level alignment (optional): shift each frame's global level to
-        # the group median instead of rejecting level outliers. ---
-        if level_align:
-            group_med = float(np.median([fr["median"] for fr in frames]))
-            offsets = []
-            for fr in frames:
-                fr["align"] = group_med - fr["median"]
-                offsets.append(fr["align"])
-            n_shifted = sum(1 for o in offsets if abs(o) > 0.5)
-            print(f"  Level alignment: group median {group_med:.2f} ADU, "
-                  f"{n_shifted} frame(s) shifted "
-                  f"(offsets {min(offsets):+.2f} .. {max(offsets):+.2f} ADU)")
+        print_group_stats(frames)
 
         # --- Quality control ---
         if len(frames) >= MIN_FRAMES_FOR_QC:
-            frames, rejected = quality_control(
-                frames, skip_median_check=level_align)
-            for fr, reason in rejected:
-                print(f"  REJECTED {fr['file'].name}: {reason}")
-        elif len(frames) > 1:
-            print(f"  QC: only {len(frames)} frames (<{MIN_FRAMES_FOR_QC}), "
-                  "no rejection applied")
+            frames, rejected, qc_info = quality_control(frames)
+            print_qc_summary(len(frames), rejected, qc_info)
+        else:
+            print(f"  {'QC':<13}: skipped, only {len(frames)} frames "
+                  f"(<{MIN_FRAMES_FOR_QC}) - no rejection applied")
+
+        # ... and again once shape filtering and QC have taken their cut.
+        if not enough_frames(len(frames), [fr["file"] for fr in frames],
+                             stage="left after QC"):
+            continue
 
         # --- Master bias selection + median-level damage screen ---
         bias_entry = None if skip_bias else find_master(
             bias_index, binx, biny, gain, temp, any_exposure=True)
         bias_ccd = None
         bias_note = None
+        near_zero = None
         if skip_bias:
             bias_note = "bias subtraction disabled (no_bias option)"
-            print(f"  NO BIAS APPLIED: {bias_note}")
+            print(f"  {'Master BIAS':<13}: NOT APPLIED - {bias_note}")
         elif bias_entry is None:
             bias_note = "no matching master BIAS (binning/gain/temp)"
-            print(f"  NO BIAS APPLIED: {bias_note}")
+            print(f"  {'Master BIAS':<13}: NOT APPLIED - {bias_note}")
         else:
             bias_ccd = read_ccd(bias_entry["path"])
             reason = None
@@ -174,56 +162,68 @@ def main():
                 reason = (f"shape mismatch: dark {shape} vs "
                           f"bias {bias_ccd.data.shape}")
             else:
-                # Screen EVERY frame with the medians already collected:
+                # Screen the group with the medians already collected:
                 # median(dark) - median(bias) predicts the post-subtraction
-                # level and costs no extra I/O.
+                # level and costs no extra I/O. The verdict is taken on the
+                # GROUP (its median, plus how many frames disagree), not on
+                # the single worst frame: individual frames sitting one ADC
+                # step low are ordinary scatter, not a mismatched bias.
                 bias_median = float(np.median(bias_ccd.data))
-                predicted = [fr["median"] + fr.get("align", 0.0) - bias_median
-                             for fr in frames]
+                predicted = [fr["median"] - bias_median for fr in frames]
+                group_predicted = float(np.median(predicted))
                 bad = [p for p in predicted if p < -NEG_MEDIAN_TOL_ADU]
-                if bad:
-                    reason = (f"{len(bad)}/{len(frames)} frames would have a "
-                              f"negative median after subtraction (worst "
-                              f"{min(bad):.2f} ADU, threshold "
-                              f"-{NEG_MEDIAN_TOL_ADU}) - bias level does not "
-                              f"match this dark session")
+                if group_predicted < -NEG_MEDIAN_TOL_ADU \
+                        or len(bad) > len(frames) / 2:
+                    reason = (f"the group median would be "
+                              f"{group_predicted:+.2f} ADU after subtraction "
+                              f"and {len(bad)}/{len(frames)} frames would go "
+                              f"below -{NEG_MEDIAN_TOL_ADU} (worst "
+                              f"{min(predicted):.2f} ADU) - bias level does "
+                              f"not match this dark session")
+                elif bad:
+                    near_zero = (f"{len(bad)}/{len(frames)} frames dip below "
+                                 f"-{NEG_MEDIAN_TOL_ADU} ADU (worst "
+                                 f"{min(predicted):.2f}) but the group median "
+                                 f"stays at {group_predicted:+.2f} ADU - "
+                                 f"bias applied")
             if reason:
                 bias_note = (f"master BIAS {bias_entry['path'].name} "
                              f"would damage the darks: {reason}")
-                print(f"  NO BIAS APPLIED: {bias_note}")
+                print(f"  {'Master BIAS':<13}: NOT APPLIED - {bias_note}")
                 bias_ccd = None
             else:
-                print(f"  Subtracting master BIAS (ccdproc): "
-                      f"{bias_entry['path'].name}")
+                print(f"  {'Master BIAS':<13}: {bias_entry['path'].name} "
+                      f"(ccdproc.subtract_bias)")
+                if near_zero:
+                    print(f"  {'':<13}  NOTE: {near_zero}")
 
         use_files = [fr["file"] for fr in frames]
         first_header = fits.getheader(use_files[0], ext=0)
-        needs_prep = (bias_ccd is not None or level_align
+        needs_prep = (bias_ccd is not None
                       or bool(first_header.get("BIASSEC"))
                       or bool(first_header.get("TRIMSEC")))
 
         with ReducedTempDir(masters_dir, "dark") as tmp:
             if needs_prep:
-                print("  Reducing each frame (ccdproc) before combining ...")
-                prepped = []
-                for fr in frames:
-                    ccd = read_ccd(fr["file"])
-                    ccd, _ = apply_overscan_trim(ccd)
-                    align = fr.get("align")
-                    if align:
-                        ccd.data = ccd.data + align
+                print(f"  {'Reducing':<13}: {len(use_files)} frames "
+                      f"(ccdproc) before combining ...")
+
+                def prep(f):
+                    ccd, _ = apply_overscan_trim(read_ccd(f))
                     if bias_ccd is not None:
                         ccd = ccdp.subtract_bias(ccd, bias_ccd)
-                    prepped.append(tmp.write(ccd, fr["file"].name))
-                use_files = prepped
+                    return tmp.write(ccd, f.name)
+
+                use_files = map_frames(prep, use_files)
 
             pd_noise = estimate_pair_noise(use_files)
             if pd_noise is not None:
-                print(f"  Pair-difference noise: {pd_noise:.3f} ADU "
+                print(f"  {'Pair noise':<13}: {pd_noise:.3f} ADU "
                       "(read + dark shot noise)")
 
-            print(f"  Combining {len(use_files)} frames (ccdproc.combine, "
-                  f"{MASTER_COMBINE_METHOD} + sigma clip) ...")
+            print(f"  {'Combining':<13}: {len(use_files)} frames, "
+                  f"{MASTER_COMBINE_METHOD} + sigma clip, "
+                  f"mem {MEM_BUDGET_MB} MB ...")
             master = combine_frames(use_files)
 
         master_median = float(np.median(master.data))
@@ -234,12 +234,6 @@ def main():
         master.header["COMBINED"] = (True, "ccdproc combined master frame")
         master.header["DARKMED"] = (round(master_median, 4),
                                     "Median of master dark [ADU]")
-        master.header["LVLALIGN"] = (level_align,
-                                     "Frame levels aligned to group median")
-        if level_align:
-            master.header.add_history(
-                "Per-frame global level aligned to the group median "
-                "before combining (level_align option)")
         if master_median < -NEG_MEDIAN_TOL_ADU:
             warn = (f"master dark median is negative ({master_median:.2f} "
                     "ADU); dark current cannot be negative - the master "
@@ -256,6 +250,8 @@ def main():
             master.header.add_history(
                 f"Master bias subtracted (ccdproc.subtract_bias): "
                 f"{bias_entry['path'].name}")
+            if near_zero:
+                master.header.add_history(f"NOTE: {near_zero}")
         else:
             master.header["BIASSUB"] = (False, "Master bias NOT subtracted")
             master.header.add_history(f"Master bias NOT applied: {bias_note}")

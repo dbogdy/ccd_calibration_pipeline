@@ -46,10 +46,11 @@ from calib_common import (collect_fits_files, env_float, env_int, fexp,
                           find_subfolder, tag)
 from grouping import group_frames
 from masters import find_master, index_masters
-from ccd_ops import (MASTER_COMBINE_METHOD, ReducedTempDir,
-                     apply_overscan_trim, combine_frames,
-                     filter_majority_shape, inv_median, print_frame_table,
-                     read_ccd, scan_frames, warn_if_nonfinite)
+from ccd_ops import (MASTER_COMBINE_METHOD, MEM_BUDGET_MB, ReducedTempDir,
+                     apply_overscan_trim, combine_frames, enough_frames,
+                     filter_majority_shape, inv_median, map_frames,
+                     print_group_stats, print_qc_summary, read_ccd,
+                     scan_frames, scan_shapes, warn_if_nonfinite)
 
 # QC thresholds for flats (overridable via config.ini [master_flat])
 MIN_FRAMES_FOR_QC = env_int("CALIB_FLAT_MIN_FRAMES_FOR_QC", 3)
@@ -68,29 +69,41 @@ def quality_control(frames):
     Reject saturated, underexposed or over-corrected flats. Brightness
     drift between frames is normal for flats and is handled by the
     per-frame scaling, so median consistency is NOT checked.
+
+    Returns (accepted, rejected, info) with the same shape as the bias/dark
+    quality control: rejected holds (frame, reason, kind) and info carries
+    the thresholds that were applied, for the summary line.
     """
+    sat_limit = SAT_MEDIAN_FRAC * SATURATION_ADU
+    low_limit = MIN_MEDIAN_FRAC * SATURATION_ADU
+    info = {"sat_limit": sat_limit, "low_limit": low_limit,
+            "safety_net": False}
+
     accepted, rejected = [], []
     for f in frames:
-        reason = None
+        reason = kind = None
         # non-positive first: it also falls below the underexposure cut,
         # but the real cause is over-correction, not exposure
         if f["median"] <= 0:
+            kind = "over-corrected"
             reason = f"non-positive median ({f['median']:.2f}) after calibration"
-        elif f["median"] > SAT_MEDIAN_FRAC * SATURATION_ADU:
+        elif f["median"] > sat_limit:
+            kind = "saturated"
             reason = (f"saturated: median {f['median']:.0f} > "
                       f"{SAT_MEDIAN_FRAC * 100:.0f}% of {SATURATION_ADU:.0f}")
-        elif f["median"] < MIN_MEDIAN_FRAC * SATURATION_ADU:
+        elif f["median"] < low_limit:
+            kind = "underexposed"
             reason = (f"underexposed: median {f['median']:.0f} < "
                       f"{MIN_MEDIAN_FRAC * 100:.0f}% of {SATURATION_ADU:.0f}")
         if reason:
-            rejected.append((f, reason))
+            rejected.append((f, reason, kind))
         else:
             accepted.append(f)
 
     if not accepted:
-        print("  WARNING: QC would reject every frame - keeping all")
-        return frames, []
-    return accepted, rejected
+        info["safety_net"] = True
+        return frames, [], info
+    return accepted, rejected, info
 
 
 def main():
@@ -150,6 +163,11 @@ def main():
         filt_str = f" filter={filt}" if filt else ""
         print(f"\nGroup bin={binx}x{biny} gain={gain} exp={fexp(exp)}s "
               f"temp={temp}C{filt_str}: {len(group['files'])} frames")
+
+        # Cheap check first: a group too small to combine is not worth
+        # looking up masters for, let alone reducing frame by frame.
+        if not enough_frames(len(group["files"]), group["files"]):
+            continue
 
         # --- Choose master dark (exact exposure, else scaled if allowed) ---
         dark_entry = find_master(dark_index, binx, biny, gain, temp, exp=exp)
@@ -229,7 +247,10 @@ def main():
         dark_ccd = read_ccd(dark_entry["path"]) if dark_entry else None
 
         # --- Reduce each flat with ccdproc into a temp folder ---
-        raw_frames = scan_frames(group["files"])
+        # Only the frame shape is needed here: the statistics that drive QC
+        # are measured after calibration (further down), so reading the raw
+        # pixel data at this point would be pure I/O waste.
+        raw_frames = scan_shapes(group["files"])
         if not raw_frames:
             print("  No readable frames in this group, skipping.")
             continue
@@ -254,12 +275,11 @@ def main():
         with ReducedTempDir(masters_dir, "flat") as tmp:
             use_files = [fr["file"] for fr in raw_frames]
             if needs_prep:
-                print("  Reducing each flat (ccdproc: overscan -> bias -> "
-                      "dark) ...")
-                prepped = []
-                for f in use_files:
-                    ccd = read_ccd(f)
-                    ccd, _ = apply_overscan_trim(ccd)
+                print(f"  {'Reducing':<13}: {len(use_files)} flats "
+                      f"(ccdproc: overscan -> bias -> dark) ...")
+
+                def prep(f):
+                    ccd, _ = apply_overscan_trim(read_ccd(f))
                     if bias_ccd is not None:
                         ccd = ccdp.subtract_bias(ccd, bias_ccd)
                     if dark_ccd is not None:
@@ -268,40 +288,65 @@ def main():
                             exposure_time="EXPTIME",
                             exposure_unit=u.second,
                             scale=dark_scaled)
-                    prepped.append(tmp.write(ccd, f.name))
-                use_files = prepped
+                    return tmp.write(ccd, f.name)
+
+                use_files = map_frames(prep, use_files)
 
             # --- QC on the frames as they will be combined ---
             frames = scan_frames(use_files)
-            print_frame_table(frames)
+            # measured after overscan/bias/dark, i.e. on the frames that will
+            # actually be combined
+            print_group_stats(frames, label="Flat")
             if len(frames) >= MIN_FRAMES_FOR_QC:
-                frames, rejected = quality_control(frames)
-                for fr, reason in rejected:
-                    print(f"  REJECTED {fr['file'].name}: {reason}")
+                frames, rejected, qc_info = quality_control(frames)
+                print_qc_summary(len(frames), rejected, qc_info)
             elif len(frames) > 1:
-                print(f"  QC: only {len(frames)} frames "
-                      f"(<{MIN_FRAMES_FOR_QC}), no rejection applied")
-            # scale=1/median cannot work on frames with median <= 0
-            for fr in [fr for fr in frames if fr["median"] <= 0]:
-                print(f"  REJECTED {fr['file'].name}: non-positive median "
-                      f"({fr['median']:.2f}) - cannot scale")
+                print(f"  {'QC':<13}: skipped, only {len(frames)} frames "
+                      f"(<{MIN_FRAMES_FOR_QC}) - no rejection applied")
+            # scale=1/median cannot work on frames with median <= 0; this
+            # runs even when QC was skipped or its safety net kept everything
+            unusable = [fr for fr in frames if fr["median"] <= 0]
+            if unusable:
+                print(f"  {'':<13}  DROPPED {len(unusable)} frame(s) with a "
+                      f"non-positive median - scale=1/median needs > 0")
             frames = [fr for fr in frames if fr["median"] > 0]
-            if not frames:
-                print("  Nothing left to combine, skipping group.")
+            # ... and again once QC and the non-positive filter have cut in.
+            if not enough_frames(len(frames), [fr["file"] for fr in frames],
+                                 stage="left after QC"):
                 continue
 
             typical_level = float(np.median([fr["median"] for fr in frames]))
 
-            print(f"  Combining {len(frames)} frames (ccdproc.combine, "
+            print(f"  {'Combining':<13}: {len(frames)} frames, "
                   f"{MASTER_COMBINE_METHOD}, scale=1/median, "
-                  f"typical level {typical_level:.0f} ADU) ...")
+                  f"typical level {typical_level:.0f} ADU, "
+                  f"mem {MEM_BUDGET_MB} MB ...")
             master = combine_frames([fr["file"] for fr in frames],
                                     scale=inv_median)
 
         # Renormalize so the master's median is exactly 1.0.
+        #
+        # scale=1/median only normalises each INPUT frame. Combining is a
+        # per-pixel average, and the median does not commute with averaging,
+        # so an average of frames that each have median 1.0 does not itself
+        # land on 1.0. The residual is driven by noise, not by the frames'
+        # differing brightness: it is a few tens of ppm for a healthy stack
+        # but reaches ~0.2% for a handful of noisy flats. Reporting it makes
+        # a weak flat set visible instead of silently absorbed.
         norm = float(np.median(master.data[np.isfinite(master.data)]))
         if norm > 0:
             master.data = master.data / norm
+            offset_ppm = (norm - 1.0) * 1e6
+            print(f"  {'Normalising':<13}: combined median was {norm:.6f} "
+                  f"-> 1.0  ({offset_ppm:+.0f} ppm)")
+            if abs(offset_ppm) > 1000:
+                print(f"  {'':<13}  WARNING: that is {abs(offset_ppm)/1e4:.2f}% "
+                      f"off - the flats are too few or too noisy for a "
+                      f"stable combination")
+        else:
+            print(f"  WARNING: the combined flat has a non-positive median "
+                  f"({norm:.6f}) - NOT normalised; the master is unusable "
+                  f"for division")
         master_min = float(np.nanmin(master.data))
         if master_min <= 0:
             n_bad = int(np.count_nonzero(master.data <= 0))
@@ -314,6 +359,8 @@ def main():
         master.header["COMBINED"] = (True, "ccdproc combined master frame")
         master.header["FLATMED"] = (round(typical_level, 2),
                                     "Typical calibrated flat level [ADU]")
+        master.header["FLATNORM"] = (round(norm, 8),
+                                     "Combined median before normalisation")
         master.header["DARKSUB"] = (dark_entry is not None,
                                     "Master dark subtracted")
         if dark_entry is not None:
@@ -342,7 +389,9 @@ def main():
                 f"{bias_entry['path'].name}")
         if dark_note:
             master.header.add_history(f"NOTE: {dark_note}")
-        master.header.add_history("Master flat normalized to median = 1.0")
+        master.header.add_history(
+            f"Master flat normalized to median = 1.0 (combined median was "
+            f"{norm:.6f}, {(norm - 1.0) * 1e6:+.0f} ppm)")
         warn_if_nonfinite(master)
 
         filt_tag = ""

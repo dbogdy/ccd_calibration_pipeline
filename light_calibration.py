@@ -219,11 +219,21 @@ def main():
         if abs(flat_med - 1.0) > 0.01:
             print(f"  NOTE: master flat median is {flat_med:.4f}, "
                   "renormalizing to 1.0 during flat_correct")
-        n_low = int(np.count_nonzero(
-            ~np.isfinite(flat_ccd.data) | (flat_ccd.data < FLAT_MIN)))
-        if n_low:
-            print(f"  NOTE: {n_low} flat pixels < {FLAT_MIN} or non-finite "
-                  f"will be clamped to {FLAT_MIN} (flat_correct min_value)")
+
+        # ccdproc's min_value clamp is a plain "< min_value" comparison, which
+        # NaN never satisfies - a non-finite flat pixel would survive the
+        # clamp and turn the matching pixel of EVERY calibrated frame into
+        # NaN. Replace them here so the clamp really covers what it claims.
+        nonfinite = ~np.isfinite(flat_ccd.data)
+        n_nan = int(np.count_nonzero(nonfinite))
+        if n_nan:
+            flat_ccd.data[nonfinite] = FLAT_MIN
+            print(f"  NOTE: {n_nan} non-finite flat pixel(s) replaced with "
+                  f"{FLAT_MIN} (they would otherwise propagate as NaN)")
+        n_low = int(np.count_nonzero(flat_ccd.data < FLAT_MIN)) - n_nan
+        if n_low > 0:
+            print(f"  NOTE: {n_low} flat pixel(s) < {FLAT_MIN} clamped to "
+                  f"{FLAT_MIN} (flat_correct min_value)")
 
         # --- Hot-pixel mask (optional): flagged once per group from the
         # master dark, then interpolated in every calibrated frame ---
@@ -234,17 +244,26 @@ def main():
                   f"(sigma={HOT_PIXEL_SIGMA}) from {dark_entry['path'].name}")
 
         # --- Calibrate each frame with ccdproc ---
+        master_shapes = [m.data.shape for m in (bias_ccd, dark_ccd, flat_ccd)
+                         if m is not None]
+        n_files = len(group["files"])
+        n_done = n_skipped = 0
+        levels_before, levels_after = [], []
+        cr_total, cr_max = 0, 0
+        show_progress = sys.stdout.isatty()
+
         for f in group["files"]:
             try:
                 ccd = read_ccd(f)
             except Exception as exc:
                 print(f"  WARNING: cannot read {f.name}: {exc} - skipped")
+                n_skipped += 1
                 continue
 
-            if ccd.data.shape != dark_ccd.data.shape \
-                    or ccd.data.shape != flat_ccd.data.shape:
+            if any(ccd.data.shape != s for s in master_shapes):
                 print(f"  WARNING: {f.name} shape {ccd.data.shape} does not "
-                      f"match masters - skipped")
+                      f"match masters {sorted(set(master_shapes))} - skipped")
+                n_skipped += 1
                 continue
 
             ccd, overscan_used = apply_overscan_trim(ccd)
@@ -315,10 +334,33 @@ def main():
             out_path = out_root / rel.parent / f"{f.stem}_cal.fits"
             out_path.parent.mkdir(parents=True, exist_ok=True)
             compact(ccd).write(out_path, overwrite=True)
+
             calibrated += 1
-            cr_str = f" [CR:{n_cr}]" if fix_cosmic_rays and n_cr else ""
-            print(f"  {f.name}: median {med_before:.1f} -> {med_after:.1f}"
-                  f"{cr_str}  -> {out_path.relative_to(root)}")
+            n_done += 1
+            levels_before.append(med_before)
+            levels_after.append(med_after)
+            cr_total += n_cr
+            cr_max = max(cr_max, n_cr)
+            if show_progress:
+                print(f"\r  {'Calibrating':<13}: {n_done}/{n_files} ...",
+                      end="", flush=True)
+
+        # --- Group summary instead of one line per frame ---
+        if show_progress and n_done:
+            print("\r", end="")
+        print(f"  {'Calibrating':<13}: {n_done}/{n_files} done"
+              + (f", {n_skipped} skipped" if n_skipped else ""))
+        if levels_after:
+            before = np.array(levels_before)
+            after = np.array(levels_after)
+            print(f"  {'Levels':<13}: median {np.median(before):.1f} -> "
+                  f"{np.median(after):.1f} ADU  "
+                  f"(after: {after.min():.1f} .. {after.max():.1f})")
+        if fix_cosmic_rays and n_done:
+            print(f"  {'Cosmic rays':<13}: {cr_total} pixel(s) cleaned in "
+                  f"total (max {cr_max} in one frame)")
+        if n_done:
+            print(f"  -> {n_done} frame(s) written to {out_root}")
 
     print(f"\nDone. {calibrated} frame(s) calibrated into {out_root}")
 

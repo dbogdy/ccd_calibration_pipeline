@@ -20,9 +20,12 @@ arrays (they are diagnostics, not calibration math).
 
 import tempfile
 import warnings
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
+import astropy.units as u
 import ccdproc as ccdp
 from astropy.io import fits
 from astropy.nddata import CCDData
@@ -53,6 +56,12 @@ SIGMA_CLIP_HIGH = env_float("CALIB_SIGMA_CLIP_HIGH", 5.0)
 MASTER_COMBINE_METHOD = env_choice("CALIB_COMBINE_METHOD", "average",
                                    ("average", "median"))
 
+# Groups smaller than this do not produce a master at all. Distinct from
+# MIN_FRAMES_FOR_QC, which only decides whether outliers may be rejected:
+# a "master" combined from one or two frames is essentially a raw frame,
+# keeping its full read noise and gaining nothing from sigma clipping.
+MIN_FRAMES_FOR_MASTER = env_int("CALIB_MIN_FRAMES_FOR_MASTER", 5)
+
 # QC thresholds (level-based QC, used for bias and dark frames)
 MIN_FRAMES_FOR_QC = env_int("CALIB_MIN_FRAMES_FOR_QC", 5)
 # below this, only warn - never reject
@@ -65,6 +74,16 @@ STD_RATIO_MAX = env_float("CALIB_STD_RATIO_MAX", 2.0)
 
 MAX_RN_PAIRS = env_int("CALIB_MAX_RN_PAIRS", 8)
 # frame pairs used for the pair-difference noise
+
+# Per-frame statistics feed the quality control and the bias-level screen
+# only - never the pixel data that ends up in a master - so they may be
+# computed on a subsampled grid ([::N, ::N]). N=1 restores full-array stats.
+STATS_SUBSAMPLE = max(1, env_int("CALIB_STATS_SUBSAMPLE", 4))
+
+# Frame reads dominate the runtime (especially through WSL's /mnt drvfs
+# layer), so scanning and per-frame reduction run on a small thread pool.
+# 1 = fully sequential.
+IO_WORKERS = max(1, env_int("CALIB_IO_WORKERS", 4))
 
 # Optional light-frame cleaning (used by light_calibration.py). Disabled by
 # default; turned on per run via config.ini [calibration]
@@ -83,11 +102,28 @@ def read_ccd(path):
     """
     Read a FITS file as CCDData. The unit comes from BUNIT; when the header
     has no (valid) unit, raw camera counts are assumed ('adu').
+
+    The unit is decided from the header *before* reading, rather than by
+    letting CCDData.read fail on a missing BUNIT and retrying with a unit.
+    That retry is not safe to run from several threads: astropy's reader can
+    then return a CCDData with unit=None instead of raising ValueError, so
+    the fallback never fires and the unitless frame only blows up later, in
+    the first ccdproc subtraction, as a confusing UnitConversionError
+    ("'adu' and '' (dimensionless) are not convertible").
     """
+    bunit = None
     try:
+        raw_unit = fits.getheader(path, ext=0).get("BUNIT")
+        if raw_unit and str(raw_unit).strip():
+            u.Unit(str(raw_unit).strip())      # validate before trusting it
+            bunit = str(raw_unit).strip()
+    except Exception:
+        bunit = None
+    # A valid BUNIT means CCDData.read finds a unit on its own and never
+    # takes the failing branch; otherwise the unit is supplied explicitly.
+    if bunit:
         return CCDData.read(path)
-    except ValueError:
-        return CCDData.read(path, unit=DEFAULT_UNIT)
+    return CCDData.read(path, unit=DEFAULT_UNIT)
 
 
 def apply_overscan_trim(ccd):
@@ -218,25 +254,111 @@ class ReducedTempDir:
 # Per-frame statistics and quality control (diagnostics, plain numpy)
 # ---------------------------------------------------------------------------
 
-def scan_frames(paths):
+def map_frames(func, items, workers=None):
     """
-    Read frames one at a time and collect per-frame statistics.
-    Returns a list of dicts: file, shape, median, std.
+    Apply func to every item, on a thread pool when it pays off. Results keep
+    the input order; frame reads release the GIL, so threads help even though
+    the work is partly numeric. Used for the per-frame scans and for the
+    per-frame reduction loops in the master builders.
     """
+    items = list(items)
+    n_workers = IO_WORKERS if workers is None else max(1, int(workers))
+    if n_workers <= 1 or len(items) < 2:
+        return [func(it) for it in items]
+    with ThreadPoolExecutor(max_workers=min(n_workers, len(items))) as pool:
+        return list(pool.map(func, items))
+
+
+def _scan_one(path, step):
+    """Per-frame statistics for one file; errors are returned, not raised."""
+    try:
+        data = fits.getdata(path, ext=0, memmap=False)
+    except Exception as exc:
+        return {"file": Path(path), "error": str(exc)}
+    shape = data.shape
+    sample = data[::step, ::step] if step > 1 else data
+    sample = np.asarray(sample, dtype=np.float32)
+    return {
+        "file": Path(path),
+        "shape": shape,
+        "median": float(np.median(sample)),
+        "std": float(mad_std(sample)),
+    }
+
+
+def scan_frames(paths, subsample=None, workers=None):
+    """
+    Collect per-frame statistics (median / noise). Statistics are measured on
+    a [::N, ::N] grid (STATS_SUBSAMPLE, config.ini [master_settings]
+    stats_subsample) because they only drive quality control, never the
+    combined pixel data. Returns a list of dicts: file, shape, median, std.
+    """
+    step = STATS_SUBSAMPLE if subsample is None else max(1, int(subsample))
+    results = map_frames(lambda p: _scan_one(p, step), paths, workers)
     frames = []
-    for f in paths:
-        try:
-            data = fits.getdata(f, ext=0).astype(np.float32)
-        except Exception as exc:
-            print(f"  WARNING: cannot read data of {Path(f).name}: {exc}")
+    for res in results:
+        if "error" in res:
+            print(f"  WARNING: cannot read data of {res['file'].name}: "
+                  f"{res['error']}")
             continue
-        frames.append({
-            "file": Path(f),
-            "shape": data.shape,
-            "median": float(np.median(data)),
-            "std": float(mad_std(data)),
-        })
+        frames.append(res)
     return frames
+
+
+def _shape_one(path):
+    """Frame shape straight from the header - no pixel data is read."""
+    try:
+        header = fits.getheader(path, ext=0)
+        return {"file": Path(path),
+                "shape": (int(header["NAXIS2"]), int(header["NAXIS1"]))}
+    except Exception as exc:
+        return {"file": Path(path), "error": str(exc)}
+
+
+def scan_shapes(paths, workers=None):
+    """
+    Like scan_frames but reads only the headers, for callers that need the
+    frame shape and nothing else (the master flat builder measures its
+    statistics after calibration, so scanning the raw pixels is wasted I/O).
+    Returns a list of dicts: file, shape.
+    """
+    results = map_frames(_shape_one, paths, workers)
+    frames = []
+    for res in results:
+        if "error" in res:
+            print(f"  WARNING: cannot read header of {res['file'].name}: "
+                  f"{res['error']}")
+            continue
+        frames.append(res)
+    return frames
+
+
+def enough_frames(count, files=None, stage="", minimum=None):
+    """
+    True when a group still has enough frames to be worth combining.
+
+    A group below the threshold is almost always a metadata typo - one stray
+    GAIN / XBINNING / SET-TEMP value splitting a handful of frames off the
+    group they belong to - so the offending files are listed. Building a
+    master from one or two frames would write a file that is essentially a
+    raw frame, with its full read noise and nothing for sigma clipping to
+    reject, under a name the master lookup would happily select later.
+    """
+    limit = MIN_FRAMES_FOR_MASTER if minimum is None else minimum
+    if count >= limit:
+        return True
+    where = f" {stage}" if stage else ""
+    print(f"  SKIPPED      : only {count} frame(s){where}, below "
+          f"min_frames_for_master ({limit}) - no master written")
+    if files:
+        files = list(files)
+        for f in files[:5]:
+            print(f"  {'':<13}  {Path(f).name}")
+        if len(files) > 5:
+            print(f"  {'':<13}  ... and {len(files) - 5} more")
+        print(f"  {'':<13}  check GAIN / XBINNING / SET-TEMP on these - a "
+              f"group this small is usually a header typo")
+    return False
 
 
 def filter_majority_shape(frames):
@@ -252,53 +374,101 @@ def filter_majority_shape(frames):
     return [fr for fr in frames if fr["shape"] == shape], shape
 
 
-def print_frame_table(frames):
-    """Print the per-frame statistics table (median / noise)."""
-    name_w = max(len(fr["file"].name) for fr in frames)
-    print(f"  {'frame':<{name_w}} {'median':>10} {'noise':>8}")
-    for fr in frames:
-        print(f"  {fr['file'].name:<{name_w}} {fr['median']:>10.2f} "
-              f"{fr['std']:>8.2f}")
+def print_group_stats(frames, label="Frame"):
+    """
+    One-line-per-quantity summary of the group (levels and noise), instead of
+    a table with one row per frame.
+    """
+    if not frames:
+        return
+    meds = np.array([fr["median"] for fr in frames], dtype=float)
+    stds = np.array([fr["std"] for fr in frames], dtype=float)
+    print(f"  {label + ' levels':<13}: median {np.median(meds):.2f} ADU  "
+          f"(range {meds.min():.2f} .. {meds.max():.2f}, "
+          f"MAD {mad_std(meds):.2f})")
+    print(f"  {label + ' noise':<13}: median {np.median(stds):.3f} ADU  "
+          f"(range {stds.min():.3f} .. {stds.max():.3f})")
 
 
-def quality_control(frames, skip_median_check=False):
+def print_qc_summary(kept, rejected, info, max_listed=3):
+    """
+    Compact quality-control report: the counts and the thresholds actually
+    used, then at most max_listed rejected frames with the rest aggregated
+    by reason.
+    """
+    limits = []
+    if info.get("median_tol") is not None:                 # bias / dark QC
+        limits.append(f"level tol +-{info['median_tol']:.2f}")
+    if info.get("std_lo") is not None:
+        limits.append(f"noise [{info['std_lo']:.2f}, {info['std_hi']:.2f}]")
+    if info.get("low_limit") is not None:                  # flat QC
+        limits.append(f"median [{info['low_limit']:.0f}, "
+                      f"{info['sat_limit']:.0f}] ADU")
+    detail = f"   ({', '.join(limits)})" if limits else ""
+    print(f"  {'QC':<13}: {kept} kept, {len(rejected)} rejected{detail}")
+
+    if info.get("safety_net"):
+        print(f"  {'':<13}  WARNING: QC would have rejected most of the group "
+              "- all frames kept (group statistics unreliable)")
+        return
+    for fr, reason, _kind in rejected[:max_listed]:
+        print(f"  {'':<13}  REJECTED {fr['file'].name}: {reason}")
+    if len(rejected) > max_listed:
+        counts = Counter(kind for _fr, _reason, kind in rejected)
+        breakdown = ", ".join(f"{k}: {v}" for k, v in sorted(counts.items()))
+        print(f"  {'':<13}  ... and {len(rejected) - max_listed} more "
+              f"({breakdown})")
+
+
+def quality_control(frames):
     """
     Flag frames whose median level or noise is inconsistent with the group.
-    With skip_median_check=True (level_align mode) only the noise check
-    runs - level deviations are corrected by alignment instead of rejected.
-    Returns (accepted, rejected) where rejected is a list of (frame, reason).
+    Returns (accepted, rejected, info): rejected holds (frame, reason, kind)
+    with kind in {"level", "noise"}, and info carries the thresholds that
+    were applied (for reporting) plus the safety_net flag.
     """
     medians = np.array([f["median"] for f in frames])
     stds = np.array([f["std"] for f in frames])
-    center = np.median(medians)
-    spread = mad_std(medians)
+    center = float(np.median(medians))
+    spread = float(mad_std(medians))
     median_tol = MEDIAN_SIGMA * spread + MEDIAN_FLOOR_ADU
-    std_center = np.median(stds)
+    std_center = float(np.median(stds))
+
+    info = {
+        "center": center,
+        "spread": spread,
+        "median_tol": median_tol,
+        "std_center": std_center,
+        "std_lo": std_center / STD_RATIO_MAX if std_center > 0 else None,
+        "std_hi": std_center * STD_RATIO_MAX if std_center > 0 else None,
+        "safety_net": False,
+    }
 
     accepted, rejected = [], []
     for f in frames:
-        reason = None
-        if not skip_median_check and abs(f["median"] - center) > median_tol:
+        reason = kind = None
+        if abs(f["median"] - center) > median_tol:
+            kind = "level"
             reason = (f"median {f['median']:.2f} deviates from group "
                       f"{center:.2f} by more than {median_tol:.2f} ADU")
         elif std_center > 0 and not (
             std_center / STD_RATIO_MAX <= f["std"] <= std_center * STD_RATIO_MAX
         ):
+            kind = "noise"
             reason = (f"noise {f['std']:.2f} ADU is outside "
                       f"[{std_center / STD_RATIO_MAX:.2f}, "
                       f"{std_center * STD_RATIO_MAX:.2f}] (group: {std_center:.2f})")
         if reason:
-            rejected.append((f, reason))
+            rejected.append((f, reason, kind))
         else:
             accepted.append(f)
 
     # Safety net: if QC would reject most of the group, the "group" statistics
-    # themselves are unreliable - keep everything and just warn.
+    # themselves are unreliable - keep everything and just flag it.
     if len(accepted) < max(2, len(frames) // 2):
-        print("  WARNING: QC would reject most frames - keeping all "
-              "(group statistics unreliable)")
-        return frames, []
-    return accepted, rejected
+        info["safety_net"] = True
+        return frames, [], info
+    return accepted, rejected, info
 
 
 def estimate_pair_noise(paths, max_pairs=MAX_RN_PAIRS):
@@ -344,20 +514,42 @@ def interpolate_bad_pixels(data, mask):
     """
     Replace each masked pixel with the median of its valid 3x3 neighbours.
     Pixels with no valid neighbour are left unchanged. Returns a float32 copy.
+
+    The eight neighbours are gathered only at the masked positions - an
+    (n_masked, 8) array - so the cost scales with the number of bad pixels
+    instead of with a Python loop over them. Masked neighbours become NaN and
+    drop out of the median, exactly as excluding them would; pixels outside
+    the frame do the same via the NaN border. There is no order dependency
+    (masked neighbours never contribute), so this matches the per-pixel loop
+    it replaces bit for bit.
     """
     out = np.asarray(data, dtype=np.float32).copy()
+    mask = np.asarray(mask, dtype=bool)
     if not mask.any():
         return out
-    h, w = out.shape
-    for r, c in zip(*np.where(mask)):
-        r0, r1 = max(0, r - 1), min(h, r + 2)
-        c0, c1 = max(0, c - 1), min(w, c + 2)
-        patch = out[r0:r1, c0:c1]
-        pmask = mask[r0:r1, c0:c1].copy()
-        pmask[r - r0, c - c0] = True          # exclude the pixel itself
-        valid = patch[~pmask]
-        if valid.size:
-            out[r, c] = float(np.median(valid))
+
+    rows, cols = np.nonzero(mask)
+    # NaN out the bad pixels, then pad by one so every 3x3 window is in range.
+    vals = np.where(mask, np.nan, out).astype(np.float32)
+    padded = np.pad(vals, 1, mode="constant", constant_values=np.nan)
+    r, c = rows + 1, cols + 1
+
+    neighbours = np.empty((rows.size, 8), dtype=np.float32)
+    k = 0
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue                      # exclude the pixel itself
+            neighbours[:, k] = padded[r + dr, c + dc]
+            k += 1
+
+    with warnings.catch_warnings():
+        # all-NaN rows (a bad pixel with no valid neighbour) are expected
+        warnings.simplefilter("ignore", RuntimeWarning)
+        medians = np.nanmedian(neighbours, axis=1)
+
+    usable = np.isfinite(medians)
+    out[rows[usable], cols[usable]] = medians[usable]
     return out
 
 

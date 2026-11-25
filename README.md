@@ -29,7 +29,7 @@ Builds master calibration frames (BIAS, DARK, FLAT) and applies them to science 
 - Combination of calibrated frames (`mean` / `median` / `sum` / `sclip`)
 - Robust handling:
   - automatic master selection based on metadata
-  - `no_bias`, `level_align` and `dark_scale` options for tricky CMOS sessions
+  - `no_bias` and `dark_scale` options for tricky CMOS sessions
   - FITS `HISTORY` updated with each processing step
 - Fully file-system based, no external database required.
 
@@ -106,21 +106,23 @@ combination  = true
 
 [general]
 temp_match_tol = 1.0                         ; max |CCD-TEMP - SET-TEMP| for a usable frame [deg C]
-mem_budget_mb  = 1024                         ; approximate RAM ceiling for combination [MB]
+mem_budget_mb  = 2048                         ; approximate RAM ceiling for combination [MB]
+io_workers     = 4                            ; threads for per-frame reads/reductions (1 = sequential)
 
 [master_settings]
 combine_method    = average                  ; average (recommended) or median
 sigma_clip_low    = 5.0                       ; sigma clipping at combination
 sigma_clip_high   = 5.0
+min_frames_for_master = 5                     ; below this frame count no master is written at all
 min_frames_for_qc = 10                        ; below this frame count, QC only warns
 median_sigma      = 5.0                       ; reject if |median - group| > median_sigma*MAD + floor
 median_floor_adu  = 5.0
 std_ratio_max     = 2.0                       ; reject if noise is outside [group/x, group*x]
 max_rn_pairs      = 8                         ; frame pairs used for read-noise estimation
+stats_subsample   = 4                         ; QC statistics on a [::N,::N] grid (1 = full array)
 
 [master_dark]
 no_bias           = true                      ; build darks from raw frames (recommended for CMOS)
-level_align       = true                      ; align each frame's level to the group median
 neg_median_tol_adu = 0.2                       ; anti-damage screen against a mismatched master bias
 
 [master_flat]
@@ -138,7 +140,7 @@ cr_sigclip        = 4.5                        ; L.A.Cosmic detection threshold 
 cr_objlim         = 5.0                        ; L.A.Cosmic CR-vs-source contrast limit
 cr_readnoise      = 8.0                        ; fallback read noise [e-] when RDNOISE is absent
 fix_hot_pixels    = false                     ; interpolate hot pixels flagged from the master dark
-hot_pixel_sigma   = 5.0                        ; hot-pixel threshold [sigma above the dark median]
+hot_pixel_sigma   = 20.0                       ; hot-pixel threshold [sigma above the dark median]
 
 [combination]
 method            = mean                      ; mean / median / sum / sclip
@@ -159,7 +161,7 @@ or specify a custom one:
 Each step can also be run standalone:
 ```bash
     python master_bias.py        <images_path> [masters_folder]
-    python master_dark.py        <images_path> [masters_folder] [no_bias] [level_align]
+    python master_dark.py        <images_path> [masters_folder] [no_bias]
     python master_flat.py        <images_path> [masters_folder] [dark_scale]
     python light_calibration.py  <images_path> [masters_folder] [dark_scale]
     python light_combination.py  <images_path>/calibrated [method]
@@ -225,9 +227,21 @@ Each step can also be run standalone:
 
 - Exposure matching uses a relative tolerance of 1e-6.
 
-- A dark is scaled by the exposure ratio only when it is bias-subtracted; a median-level screen blocks a master bias that would drive the darks negative (CMOS with an unstable bias level).
+- A dark is scaled by the exposure ratio only when it is bias-subtracted; a median-level screen blocks a master bias that would drive the darks negative (CMOS with an unstable bias level). The verdict is taken on the **group** — its median plus how many frames disagree — so a single frame sitting one ADC step low no longer disables bias subtraction for the whole session.
 
 - Optional per-frame cleaning (both off by default): `fix_hot_pixels` flags hot pixels from the master dark (`clipped_median + hot_pixel_sigma·clipped_std`) and replaces them with the 3×3 neighbour median; `fix_cosmic_rays` runs L.A.Cosmic. These are cosmetic per-frame steps — for pure statistical outlier rejection across a stack, prefer the `sclip` combination method.
+
+  Note that the clipped std reflects the master dark's noise floor, not the exposure, while the warm-pixel tail grows with exposure time — so a low `hot_pixel_sigma` repairs a much larger fraction of a long dark than of a short one. Keep it high enough that only pixels dark subtraction genuinely cannot fix are touched.
+
+- `min_frames_for_master` (default 5) is checked twice per group: once on the raw group, before any pixel is read, and once on what survives shape filtering and QC. It is separate from `min_frames_for_qc`, which only decides whether outliers may be *rejected*. Its purpose is to catch a stray `GAIN` / `XBINNING` / `SET-TEMP` value that splits a handful of frames into a group of their own — combining those would write a "master" that is really just a raw frame, keeping its full read noise, with nothing for sigma clipping to reject, under a filename the master lookup would later select as if it were sound. Skipped groups list their files so the offending header is easy to spot.
+
+- Master darks are built without any per-frame level alignment. Shifting each frame onto the group median (the former `level_align` option) moved a pooled master's absolute level in an arbitrary direction whenever the group spanned several sessions, so it was removed; build masters per session instead.
+
+- Every master type takes the same path in and out: frames are staged as float32 into a temporary folder, combined from there, and written back as a single float32 HDU with `BUNIT=adu`. The bias builder used to skip staging when the camera provided no overscan section, which fed raw integer frames to `ccdproc.combine` — and since `combine` re-reads each file once per memory chunk, an integer frame is materialised in full for every chunk while a float32 frame is read as a lazy view (~128 ms against ~12 ms per file per chunk). Staging is now unconditional.
+
+- `read_ccd` resolves the unit from `BUNIT` *before* reading, instead of letting `CCDData.read` fail on a missing unit and retrying. The retry is not thread-safe: with `io_workers > 1`, astropy's reader can return a `CCDData` with `unit=None` rather than raising `ValueError`, so the fallback never fires and the unitless frame surfaces much later as `UnitConversionError: 'adu' and '' (dimensionless) are not convertible` in the first subtraction.
+
+- Per-frame statistics used by quality control are measured on a `[::N, ::N]` grid (`stats_subsample`). They never touch the combined pixel data — only which frames are accepted and the bias-level screen — so the default `N=4` costs nothing in accuracy on quantized camera data. Set it to `1` for full-array statistics.
 
 - FITS metadata and processing history are preserved in the output headers.
 

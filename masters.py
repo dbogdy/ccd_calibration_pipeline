@@ -41,6 +41,10 @@ def index_masters(masters_dir: Path, imagetyp: str):
         if str(header.get("IMAGETYP", "")).strip().upper() != imagetyp:
             continue
         set_t = as_int(header.get("SET-TEMP"))
+        try:
+            mtime = f.stat().st_mtime
+        except OSError:
+            mtime = 0.0
         index.append({
             "path": f,
             "binx": as_int(header.get("XBINNING")),
@@ -51,6 +55,8 @@ def index_masters(masters_dir: Path, imagetyp: str):
             else as_int(header.get("CCD-TEMP")),
             "filter": str(header.get("FILTER", "")).strip() or None,
             "biassub": bool(header.get("BIASSUB", False)),
+            # cached here so tie-breaking never re-stats the file
+            "mtime": mtime,
         })
     return index
 
@@ -97,4 +103,4 @@ def find_master(index, binx, biny, gain, temp, exp=None, any_exposure=False,
         return None
     best_de, best_dt, _ = min(candidates, key=lambda c: (c[0], c[1]))
     best = [b for de, dt, b in candidates if de == best_de and dt == best_dt]
-    return max(best, key=lambda b: b["path"].stat().st_mtime)
+    return max(best, key=lambda b: b.get("mtime", 0.0))

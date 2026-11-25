@@ -29,8 +29,12 @@ combination = true
 ; Grouping and master matching are done on SET-TEMP (exact); a frame is
 ; dropped when |CCD-TEMP - SET-TEMP| exceeds this threshold [deg C]
 temp_match_tol = 1.0
-; Approximate RAM ceiling for combination [MB]
-mem_budget_mb = 1024
+; Approximate RAM ceiling for combination [MB]. Higher = fewer chunks in
+; ccdproc.combine; keep it below the RAM actually available.
+mem_budget_mb = 2048
+; Threads used for the per-frame reads and reductions. Frame I/O dominates
+; the runtime (especially over /mnt in WSL). 1 = fully sequential.
+io_workers = 4
 
 [master_settings]
 ; Common settings for all masters (bias / dark / flat).
@@ -39,6 +43,10 @@ combine_method = average
 ; Sigma clipping at combination (astropy guide: 5/5)
 sigma_clip_low = 5.0
 sigma_clip_high = 5.0
+; Below this frame count a group produces NO master at all (bias/dark/flat).
+; Guards against a stray GAIN / XBINNING / SET-TEMP typo splitting a few
+; frames into their own group. Set 1 to allow single-frame masters.
+min_frames_for_master = 5
 ; QC bias/dark: below this frame count, only warn - never reject
 min_frames_for_qc = 10
 ; QC: reject if |median - group| > median_sigma * MAD + median_floor_adu
@@ -48,6 +56,9 @@ median_floor_adu = 5.0
 std_ratio_max = 2.0
 ; Frame pairs used to estimate read noise / pair noise
 max_rn_pairs = 8
+; Per-frame QC statistics are measured on a [::N, ::N] grid. They only drive
+; quality control, never the combined pixels. 1 = full-array statistics.
+stats_subsample = 4
 
 [master_bias]
 ; (no specific settings - uses [master_settings])
@@ -55,10 +66,9 @@ max_rn_pairs = 8
 [master_dark]
 ; Build darks from raw frames, without bias subtraction (recommended CMOS)
 no_bias = true
-; Align each frame's global level to the group median instead of rejecting
-level_align = true
-; Anti-damage: bias is NOT applied if the predicted median of any frame
-; would drop below -this threshold [ADU]
+; Anti-damage: bias is NOT applied when the GROUP median would drop below
+; -this threshold [ADU], or when more than half the frames would. Single
+; frames dipping slightly below zero only produce a note.
 neg_median_tol_adu = 0.2
 
 [master_flat]
@@ -81,8 +91,13 @@ cr_sigclip = 4.5
 cr_objlim = 5.0
 cr_readnoise = 8.0
 ; Hot-pixel repair: interpolate pixels flagged from the master dark
+; (threshold = clipped_median + sigma * clipped_std of the master dark).
+; The clipped std tracks the master's noise floor rather than the exposure,
+; so a low sigma flags far more pixels on long darks than on short ones.
+; A high sigma (~20) keeps the repaired fraction small and roughly constant
+; across exposures - only pixels dark subtraction genuinely cannot fix.
 fix_hot_pixels = true
-hot_pixel_sigma = 5.0
+hot_pixel_sigma = 20.0
 
 [combination]
 ; Combination method: mean / median / sum / sclip

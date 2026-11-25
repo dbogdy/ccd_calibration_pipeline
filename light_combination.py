@@ -179,12 +179,19 @@ def main():
             except Exception:
                 shp = None
             shapes.setdefault(shp, []).append(f)
-        shape = max(shapes, key=lambda s: len(shapes[s]))
-        use_files = shapes[shape]
+        # Files whose shape could not be read are never the reference: an
+        # unreadable header must not define what the group looks like.
+        known = {s: fl for s, fl in shapes.items() if s is not None}
+        if not known:
+            print("  WARNING: no readable frame shape in this group, skipping.")
+            continue
+        shape = max(known, key=lambda s: len(known[s]))
+        use_files = known[shape]
         for s, fl in shapes.items():
             if s != shape:
                 for f in fl:
-                    print(f"  WARNING: {f.name} has shape {s}, "
+                    label = s if s is not None else "unreadable header"
+                    print(f"  WARNING: {f.name} has shape {label}, "
                           f"group uses {shape} - excluded")
         if len(use_files) < 2:
             print("  Fewer than 2 usable frames left, skipping.")

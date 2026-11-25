@@ -10,7 +10,7 @@ Reads the configuration ("config.ini" next to this script by default),
 then runs the enabled steps in order by invoking the existing scripts:
 
     1. master_bias.py        <images_path> <masters_dir>
-    2. master_dark.py        <images_path> <masters_dir> [no_bias] [level_align]
+    2. master_dark.py        <images_path> <masters_dir> [no_bias]
     3. master_flat.py        <images_path> <masters_dir> [dark_scale]
     4. light_calibration.py  <images_path> <masters_dir> [dark_scale]
     5. light_combination.py  <calibrated_dir> [method]
@@ -57,15 +57,20 @@ def _master_combine_method(raw):
 SETTINGS = {
     ("general", "temp_match_tol"):            ("CALIB_TEMP_MATCH_TOL", float),
     ("general", "mem_budget_mb"):             ("CALIB_MEM_BUDGET_MB", int),
+    ("general", "io_workers"):                ("CALIB_IO_WORKERS", int),
     ("master_settings", "combine_method"):    ("CALIB_COMBINE_METHOD",
                                                _master_combine_method),
     ("master_settings", "sigma_clip_low"):    ("CALIB_SIGMA_CLIP_LOW", float),
     ("master_settings", "sigma_clip_high"):   ("CALIB_SIGMA_CLIP_HIGH", float),
+    ("master_settings", "min_frames_for_master"):
+                                              ("CALIB_MIN_FRAMES_FOR_MASTER",
+                                               int),
     ("master_settings", "min_frames_for_qc"): ("CALIB_MIN_FRAMES_FOR_QC", int),
     ("master_settings", "median_sigma"):      ("CALIB_MEDIAN_SIGMA", float),
     ("master_settings", "median_floor_adu"):  ("CALIB_MEDIAN_FLOOR_ADU", float),
     ("master_settings", "std_ratio_max"):     ("CALIB_STD_RATIO_MAX", float),
     ("master_settings", "max_rn_pairs"):      ("CALIB_MAX_RN_PAIRS", int),
+    ("master_settings", "stats_subsample"):   ("CALIB_STATS_SUBSAMPLE", int),
     ("master_dark", "neg_median_tol_adu"):    ("CALIB_NEG_MEDIAN_TOL_ADU", float),
     ("master_flat", "min_frames_for_qc"):     ("CALIB_FLAT_MIN_FRAMES_FOR_QC", int),
     ("master_flat", "saturation_adu"):        ("CALIB_SATURATION_ADU", float),
@@ -78,12 +83,21 @@ SETTINGS = {
     ("calibration", "cr_readnoise"):          ("CALIB_CR_READNOISE", float),
 }
 
+# Settings that were removed, with the reason - so an old config.ini fails
+# with an explanation instead of a bare "unknown key".
+REMOVED_KEYS = [
+    ("master_dark", "level_align",
+     "per-frame level alignment was dropped: on groups spanning several "
+     "sessions it shifted the master's absolute level in an arbitrary "
+     "direction. Build the masters per session instead."),
+]
+
 # Non-numeric per-step options consumed by build_steps, allowed per section.
 STEP_OPTIONS = {
     "general": set(),
     "master_settings": set(),
     "master_bias": set(),
-    "master_dark": {"no_bias", "level_align"},
+    "master_dark": {"no_bias"},
     "master_flat": {"dark_scale"},
     "calibration": {"dark_scale", "fix_hot_pixels", "fix_cosmic_rays"},
     "combination": {"method"},
@@ -103,6 +117,13 @@ def build_env(config):
               "keys into [general] / [master_settings] / [master_dark] / "
               "[master_flat] / [calibration].")
         sys.exit(1)
+
+    # Keys that used to exist: a plain "unknown key" message would not say
+    # why they disappeared.
+    for section, key, note in REMOVED_KEYS:
+        if config.has_section(section) and config.has_option(section, key):
+            print(f"ERROR: [{section}] {key} no longer exists - {note}")
+            sys.exit(1)
 
     env = os.environ.copy()
     applied = []
@@ -201,8 +222,6 @@ def build_steps(config):
                str(images_path), str(masters_dir)]
         if option("master_dark", "no_bias"):
             cmd.append("no_bias")
-        if option("master_dark", "level_align"):
-            cmd.append("level_align")
         steps.append(("master dark", cmd))
 
     if enabled("master_flat"):
